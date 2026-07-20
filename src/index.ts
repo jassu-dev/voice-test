@@ -72,14 +72,18 @@ app.ws("/media-stream/:callId", async (ws: any, req) => {
 
   const sendToTwilio = (payload: string) => {
     if (streamSid) {
-      ws.send(JSON.stringify({ event: "media", streamSid, media: { payload } }));
+      ws.send(JSON.stringify({ event: "media", streamSid, media: { payload } }), (err: any) => {
+        if (err) console.log(`[${callId}] send error: ${err.message}`);
+      });
     } else {
       pendingAudio.push(payload);
     }
   };
 
   const clearTwilio = () => {
-    if (streamSid) ws.send(JSON.stringify({ event: "clear", streamSid }));
+    if (streamSid) ws.send(JSON.stringify({ event: "clear", streamSid }), (err: any) => {
+      if (err) console.log(`[${callId}] clear error: ${err.message}`);
+    });
   };
 
   // Connect xAI immediately
@@ -96,6 +100,7 @@ app.ws("/media-stream/:callId", async (ws: any, req) => {
   // Handle messages from xAI
   xaiWs.on("message", (data: Buffer, isBinary: boolean) => {
     if (isBinary) {
+      console.log(`[${callId}] binary audio len=${data.length} sid=${streamSid}`);
       sendToTwilio(data.toString("base64"));
       return;
     }
@@ -106,7 +111,10 @@ app.ws("/media-stream/:callId", async (ws: any, req) => {
 
     switch (msg.type) {
       case "response.output_audio.delta":
-        if (msg.delta) sendToTwilio(msg.delta);
+        if (msg.delta) {
+          console.log(`[${callId}] sending audio chunk len=${msg.delta.length} sid=${streamSid}`);
+          sendToTwilio(msg.delta);
+        }
         break;
 
       case "response.created":
