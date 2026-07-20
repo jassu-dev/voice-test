@@ -99,7 +99,18 @@ app.ws("/media-stream/:callId", async (ws, req) => {
   let turnCount = 0;
   let turnActive = false;
 
-  xaiWs.on("message", (data: Buffer) => {
+  xaiWs.on("message", (data: Buffer, isBinary: boolean) => {
+    // xAI sends audio as binary WebSocket frames
+    if (isBinary) {
+      const payload = data.toString("base64");
+      if (tw.streamSid) {
+        tw.send({ event: "media", streamSid: tw.streamSid, media: { payload } });
+      } else {
+        pendingAudio.push(payload);
+      }
+      return;
+    }
+
     try {
       const msg = JSON.parse(data.toString());
 
