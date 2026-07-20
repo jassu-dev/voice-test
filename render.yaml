@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: xai-telephony
+    env: node
+    region: oregon  # US West — close to xAI servers
+    plan: free
+    rootDir: .
+    buildCommand: npm install && npm run build
+    startCommand: node dist/index.js
+    envVars:
+      - key: XAI_API_KEY
+        sync: false
+      - key: API_URL
+        value: wss://api.x.ai/v1/realtime
+      - key: HOSTNAME
+        sync: false  # set this to your render URL after first deploy
+      - key: ENABLE_TOOLS
+        value: "true"
+      - key: NODE_ENV
+        value: production
