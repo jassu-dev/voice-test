@@ -99,12 +99,25 @@ app.ws("/media-stream/:callId", async (ws, req) => {
   let turnCount = 0;
   let turnActive = false;
 
-  xaiWs.on("message", (data: Buffer) => {
+  xaiWs.on("message", (data: Buffer, isBinary: boolean) => {
+    // Binary frames = raw audio chunks (when binary transport is active)
+    if (isBinary) {
+      const payload = data.toString("base64");
+      if (tw.streamSid) {
+        tw.send({ event: "media", streamSid: tw.streamSid, media: { payload } });
+      } else {
+        pendingAudio.push(payload);
+      }
+      return;
+    }
+
     try {
       const msg = JSON.parse(data.toString());
 
       if (msg.type !== "response.output_audio.delta") {
         console.log(`[${callId}] ${msg.type}`);
+      } else {
+        console.log(`[${callId}] audio delta len=${msg.delta?.length || 0} streamSid=${!!tw.streamSid}`);
       }
 
       switch (msg.type) {
@@ -114,9 +127,10 @@ app.ws("/media-stream/:callId", async (ws, req) => {
             if (tw.streamSid) {
               tw.send({ event: "media", streamSid: tw.streamSid, media: { payload: msg.delta } });
             } else {
-              // streamSid not ready yet — buffer it
               pendingAudio.push(msg.delta);
             }
+          } else {
+            console.log(`[${callId}] audio delta with no payload`);
           }
           break;
 
