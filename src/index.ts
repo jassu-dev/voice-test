@@ -70,6 +70,7 @@ app.ws("/media-stream/:callId", async (ws: any, req) => {
   let bargedIn = false;
   const pendingAudio: string[] = [];
 
+  // ── Send audio to Twilio, buffer if streamSid not ready yet ─────────────
   const sendToTwilio = (payload: string) => {
     if (streamSid) {
       ws.send(JSON.stringify({ event: "media", streamSid, media: { payload } }), (err: any) => {
@@ -80,24 +81,7 @@ app.ws("/media-stream/:callId", async (ws: any, req) => {
     }
   };
 
-  const clearTwilio = () => {
-    if (streamSid) ws.send(JSON.stringify({ event: "clear", streamSid }), (err: any) => {
-      if (err) console.log(`[${callId}] clear error: ${err.message}`);
-    });
-  };
-
-  // Connect xAI immediately
-  const xaiWs = new WebSocket(API_URL, {
-    headers: { Authorization: `Bearer ${XAI_API_KEY}` },
-  });
-
-  const xaiReady = new Promise<void>((resolve, reject) => {
-    const t = setTimeout(() => { xaiWs.close(); reject(new Error("xAI timeout")); }, 10000);
-    xaiWs.on("open", () => { clearTimeout(t); console.log(`[${callId}] xAI connected`); resolve(); });
-    xaiWs.on("error", (e: any) => { clearTimeout(t); reject(e); });
-  });
-
-  // Handle messages from Twilio — register BEFORE awaiting xAI so we don't miss start event
+  // ── Register Twilio message handler FIRST before any await ───────────────
   ws.on("message", (raw: string) => {
     let msg: any;
     try { msg = JSON.parse(raw.toString()); } catch { return; }
@@ -105,50 +89,63 @@ app.ws("/media-stream/:callId", async (ws: any, req) => {
     if (msg.event === "start") {
       streamSid = msg.start.streamSid;
       console.log(`[${callId}] twilio ready sid=${streamSid}`);
-      for (const p of pendingAudio) {
-        ws.send(JSON.stringify({ event: "media", streamSid, media: { payload: p } }));
+      // Flush buffered audio (greeting may have arrived before streamSid)
+      if (pendingAudio.length > 0) {
+        console.log(`[${callId}] flushing ${pendingAudio.length} buffered chunks`);
+        for (const p of pendingAudio) {
+          ws.send(JSON.stringify({ event: "media", streamSid, media: { payload: p } }));
+        }
+        pendingAudio.length = 0;
       }
-      pendingAudio.length = 0;
-
     } else if (msg.event === "media") {
       if (msg.media?.track !== "inbound") return;
       if (!sessionReady || xaiWs.readyState !== 1) return;
       xaiWs.send(JSON.stringify({ type: "input_audio_buffer.append", audio: msg.media.payload }));
-
     } else if (msg.event === "stop") {
       console.log(`[${callId}] call ended`);
       xaiWs.close();
     }
   });
 
-  ws.on("close", () => xaiWs.close());
+  ws.on("close", () => { try { xaiWs.close(); } catch {} });
 
-  await xaiReady;
+  // ── Connect to xAI ───────────────────────────────────────────────────────
+  const xaiWs = new WebSocket(API_URL, {
+    headers: { Authorization: `Bearer ${XAI_API_KEY}` },
+  });
 
-  // Handle messages from xAI
+  await new Promise<void>((resolve, reject) => {
+    const t = setTimeout(() => { xaiWs.close(); reject(new Error("xAI timeout")); }, 10000);
+    xaiWs.on("open", () => { clearTimeout(t); console.log(`[${callId}] xAI connected`); resolve(); });
+    xaiWs.on("error", (e: any) => { clearTimeout(t); reject(e); });
+  });
+
+  // ── Handle xAI messages ──────────────────────────────────────────────────
   xaiWs.on("message", (data: Buffer, isBinary: boolean) => {
+    // Binary frame = raw audio (when binary transport active)
     if (isBinary) {
-      console.log(`[${callId}] binary audio len=${data.length} sid=${streamSid}`);
       sendToTwilio(data.toString("base64"));
       return;
     }
+
     let msg: any;
     try { msg = JSON.parse(data.toString()); } catch { return; }
 
-    if (msg.type !== "response.output_audio.delta") console.log(`[${callId}] ${msg.type}`);
+    if (msg.type !== "response.output_audio.delta") {
+      console.log(`[${callId}] ${msg.type}`);
+    }
 
     switch (msg.type) {
+
+      // ── Audio: forward each delta to Twilio immediately ─────────────────
       case "response.output_audio.delta":
-        if (msg.delta) {
-          console.log(`[${callId}] sending audio chunk len=${msg.delta.length} sid=${streamSid}`);
-          sendToTwilio(msg.delta);
-        }
+        if (msg.delta) sendToTwilio(msg.delta);
         break;
 
       case "response.created":
-        if (turnActive) console.log(`[${callId}] interrupted`);
-        turnCount++; turnActive = true;
-        console.log(`[${callId}] turn ${turnCount}`);
+        turnCount++;
+        turnActive = true;
+        console.log(`[${callId}] turn ${turnCount} started`);
         break;
 
       case "response.done":
@@ -164,28 +161,31 @@ app.ws("/media-stream/:callId", async (ws: any, req) => {
         if (msg.transcript) console.log(`\n[${callId}] User: "${msg.transcript}"`);
         break;
 
+      // ── Barge-in: caller spoke while agent was talking ──────────────────
       case "input_audio_buffer.speech_started":
         bargedIn = turnActive;
         turnActive = false;
-        console.log(`[${callId}] speech_started bargedIn=${bargedIn}`);
-        clearTwilio();
+        console.log(`[${callId}] barge-in=${bargedIn}`);
+        // Clear Twilio's buffer so audio stops instantly
+        if (streamSid) ws.send(JSON.stringify({ event: "clear", streamSid }));
         break;
 
       case "input_audio_buffer.speech_stopped":
         console.log(`[${callId}] speech_stopped`);
         break;
 
+      // ── After commit: request response (server_vad doesn't always auto-request) ──
       case "input_audio_buffer.committed":
         console.log(`[${callId}] committed`);
-        // Always request response — server_vad doesn't reliably auto-request
         bargedIn = false;
         xaiWs.send(JSON.stringify({ type: "response.create" }));
         break;
 
+      // ── Session configured: send greeting via force_message ────────────
+      // force_message = pure TTS synthesis, no LLM round-trip = fast first word
       case "session.updated":
         sessionReady = true;
-        console.log(`[${callId}] session ready — sending greeting`);
-        // force_message = pure TTS, no LLM round-trip = instant first audio
+        console.log(`[${callId}] session ready`);
         xaiWs.send(JSON.stringify({
           type: "conversation.item.create",
           item: {
@@ -197,28 +197,30 @@ app.ws("/media-stream/:callId", async (ws: any, req) => {
         }));
         break;
 
+      // ── Configure session when conversation is created ──────────────────
       case "conversation.created":
         xaiWs.send(JSON.stringify({
           type: "session.update",
           session: {
             instructions: bot.instructions,
-            voice: "ara",
-            reasoning: { effort: "none" },
+            voice: "celeste",       // warm, reassuring — great for phone support
+            reasoning: { effort: "none" },   // fastest responses for conversation
             turn_detection: {
               type: "server_vad",
-              threshold: 0.6,
-              silence_duration_ms: 500,
-              prefix_padding_ms: 300,
+              threshold: 0.6,              // catches speech reliably on phone calls
+              silence_duration_ms: 500,    // natural pause before responding
+              prefix_padding_ms: 300,      // don't clip first syllable
             },
             audio: {
-              input:  { format: { type: "audio/pcmu" } },
-              output: { format: { type: "audio/pcmu" } },
+              input:  { format: { type: "audio/pcmu" } },  // Twilio native mulaw
+              output: { format: { type: "audio/pcmu" } },  // Twilio native mulaw
             },
             ...(ENABLE_TOOLS ? { tools } : {}),
           },
         }));
         break;
 
+      // ── Function tool call ──────────────────────────────────────────────
       case "response.output_item.done":
         if (msg.item?.type === "function_call") {
           (async () => {
@@ -245,7 +247,7 @@ app.ws("/media-stream/:callId", async (ws: any, req) => {
 });
 
 // ── Outbound ───────────────────────────────────────────────────────────────
-const OUTBOUND_INSTRUCTIONS = `You are an outbound AI phone agent. YOU speak first. Greet warmly, keep replies short.`;
+const OUTBOUND_INSTRUCTIONS = `You are an outbound AI phone agent. YOU speak first. Greet warmly, keep replies short and conversational.`;
 
 app.post("/outbound-twiml", (_req, res) => {
   const hostname = (process.env.HOSTNAME || "").replace(/^https?:\/\//, "").replace(/\/$/, "");
@@ -280,9 +282,14 @@ app.ws("/outbound-stream", (ws: any) => {
           type: "session.update",
           session: {
             instructions: OUTBOUND_INSTRUCTIONS,
-            voice: "rex",
+            voice: "atlas",        // confident, commanding — good for outbound
             reasoning: { effort: "none" },
-            turn_detection: { type: "server_vad", threshold: 0.6, silence_duration_ms: 500, prefix_padding_ms: 300 },
+            turn_detection: {
+              type: "server_vad",
+              threshold: 0.6,
+              silence_duration_ms: 500,
+              prefix_padding_ms: 300,
+            },
             audio: {
               input:  { format: { type: "audio/pcmu" } },
               output: { format: { type: "audio/pcmu" } },
@@ -299,13 +306,16 @@ app.ws("/outbound-stream", (ws: any) => {
         let m: any;
         try { m = JSON.parse(d.toString()); } catch { return; }
         if (m.type !== "response.output_audio.delta") console.log(`[OUTBOUND][${callSid}] ${m.type}`);
+
         switch (m.type) {
           case "session.updated":
             sessionReady = true;
+            // Agent speaks first on outbound
             xaiWs.send(JSON.stringify({ type: "response.create" }));
             break;
           case "response.created":
-            turnCount++; turnActive = true;
+            turnCount++;
+            turnActive = true;
             break;
           case "response.output_audio.delta":
             if (m.delta && streamSid)
@@ -341,7 +351,7 @@ app.ws("/outbound-stream", (ws: any) => {
     }
   });
 
-  ws.on("close", () => xaiWs?.close());
+  ws.on("close", () => { try { xaiWs?.close(); } catch {} });
 });
 
 const port = process.env.PORT || "3000";
