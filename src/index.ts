@@ -99,18 +99,7 @@ app.ws("/media-stream/:callId", async (ws, req) => {
   let turnCount = 0;
   let turnActive = false;
 
-  xaiWs.on("message", (data: Buffer, isBinary: boolean) => {
-    // Binary frames = raw audio chunks (when binary transport is active)
-    if (isBinary) {
-      const payload = data.toString("base64");
-      if (tw.streamSid) {
-        tw.send({ event: "media", streamSid: tw.streamSid, media: { payload } });
-      } else {
-        pendingAudio.push(payload);
-      }
-      return;
-    }
-
+  xaiWs.on("message", (data: Buffer) => {
     try {
       const msg = JSON.parse(data.toString());
 
@@ -166,8 +155,7 @@ app.ws("/media-stream/:callId", async (ws, req) => {
           break;
 
         case "input_audio_buffer.committed":
-          console.log(`[${callId}] buffer committed — requesting response`);
-          xaiWs.send(JSON.stringify({ type: "response.create" }));
+          console.log(`[${callId}] buffer committed`);
           break;
 
         case "session.updated":
