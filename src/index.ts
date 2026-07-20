@@ -102,6 +102,8 @@ app.ws("/media-stream/:callId", async (ws, req) => {
         case "response.output_audio.delta":
           if (msg.delta && tw.streamSid) {
             tw.send({ event: "media", streamSid: tw.streamSid, media: { payload: msg.delta } });
+          } else if (!tw.streamSid) {
+            console.log(`[${callId}] WARNING: audio delta arrived but streamSid not set yet`);
           }
           break;
 
@@ -133,10 +135,8 @@ app.ws("/media-stream/:callId", async (ws, req) => {
           break;
 
         case "input_audio_buffer.speech_stopped":
-          console.log(`[${callId}] speech stopped — committing immediately`);
-          // Commit audio and request response right away instead of waiting for VAD silence timer
-          xaiWs.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
-          xaiWs.send(JSON.stringify({ type: "response.create" }));
+          console.log(`[${callId}] speech stopped`);
+          // server_vad handles commit+response automatically — don't manually trigger
           break;
 
         case "session.updated":
