@@ -91,11 +91,39 @@ app.ws("/media-stream/:callId", async (ws: any, req) => {
     headers: { Authorization: `Bearer ${XAI_API_KEY}` },
   });
 
-  await new Promise<void>((resolve, reject) => {
+  const xaiReady = new Promise<void>((resolve, reject) => {
     const t = setTimeout(() => { xaiWs.close(); reject(new Error("xAI timeout")); }, 10000);
     xaiWs.on("open", () => { clearTimeout(t); console.log(`[${callId}] xAI connected`); resolve(); });
     xaiWs.on("error", (e: any) => { clearTimeout(t); reject(e); });
   });
+
+  // Handle messages from Twilio — register BEFORE awaiting xAI so we don't miss start event
+  ws.on("message", (raw: string) => {
+    let msg: any;
+    try { msg = JSON.parse(raw.toString()); } catch { return; }
+
+    if (msg.event === "start") {
+      streamSid = msg.start.streamSid;
+      console.log(`[${callId}] twilio ready sid=${streamSid}`);
+      for (const p of pendingAudio) {
+        ws.send(JSON.stringify({ event: "media", streamSid, media: { payload: p } }));
+      }
+      pendingAudio.length = 0;
+
+    } else if (msg.event === "media") {
+      if (msg.media?.track !== "inbound") return;
+      if (!sessionReady || xaiWs.readyState !== 1) return;
+      xaiWs.send(JSON.stringify({ type: "input_audio_buffer.append", audio: msg.media.payload }));
+
+    } else if (msg.event === "stop") {
+      console.log(`[${callId}] call ended`);
+      xaiWs.close();
+    }
+  });
+
+  ws.on("close", () => xaiWs.close());
+
+  await xaiReady;
 
   // Handle messages from xAI
   xaiWs.on("message", (data: Buffer, isBinary: boolean) => {
@@ -212,34 +240,8 @@ app.ws("/media-stream/:callId", async (ws: any, req) => {
     }
   });
 
-  // Handle messages from Twilio — single direct listener
-  ws.on("message", (raw: string) => {
-    let msg: any;
-    try { msg = JSON.parse(raw.toString()); } catch { return; }
-
-    if (msg.event === "start") {
-      streamSid = msg.start.streamSid;
-      console.log(`[${callId}] twilio ready sid=${streamSid}`);
-      // Flush buffered audio
-      for (const p of pendingAudio) {
-        ws.send(JSON.stringify({ event: "media", streamSid, media: { payload: p } }));
-      }
-      pendingAudio.length = 0;
-
-    } else if (msg.event === "media") {
-      if (msg.media?.track !== "inbound") return;
-      if (!sessionReady || xaiWs.readyState !== 1) return;
-      xaiWs.send(JSON.stringify({ type: "input_audio_buffer.append", audio: msg.media.payload }));
-
-    } else if (msg.event === "stop") {
-      console.log(`[${callId}] call ended`);
-      xaiWs.close();
-    }
-  });
-
   xaiWs.on("error", (e: any) => console.log(`[${callId}] ws error: ${e?.message}`));
   xaiWs.on("close", (code: number) => console.log(`[${callId}] ws closed: ${code}`));
-  ws.on("close", () => xaiWs.close());
 });
 
 // ── Outbound ───────────────────────────────────────────────────────────────
