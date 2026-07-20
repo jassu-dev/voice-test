@@ -69,10 +69,20 @@ app.ws("/media-stream/:callId", async (ws, req) => {
 
   const WebSocket = require("ws");
   const tw = new TwilioMediaStreamWebsocket(ws);
+  // Buffer audio that arrives before streamSid is set
+  const pendingAudio: string[] = [];
 
   tw.on("start", (msg) => {
     tw.streamSid = msg.start.streamSid;
     console.log(`[${callId}] twilio.start sid=${tw.streamSid}`);
+    // Flush any audio that arrived before streamSid was ready
+    if (pendingAudio.length > 0) {
+      console.log(`[${callId}] flushing ${pendingAudio.length} buffered audio chunks`);
+      for (const payload of pendingAudio) {
+        tw.send({ event: "media", streamSid: tw.streamSid!, media: { payload } });
+      }
+      pendingAudio.length = 0;
+    }
   });
 
   const xaiWs = new WebSocket(API_URL, {
@@ -100,10 +110,13 @@ app.ws("/media-stream/:callId", async (ws, req) => {
       switch (msg.type) {
 
         case "response.output_audio.delta":
-          if (msg.delta && tw.streamSid) {
-            tw.send({ event: "media", streamSid: tw.streamSid, media: { payload: msg.delta } });
-          } else if (!tw.streamSid) {
-            console.log(`[${callId}] WARNING: audio delta arrived but streamSid not set yet`);
+          if (msg.delta) {
+            if (tw.streamSid) {
+              tw.send({ event: "media", streamSid: tw.streamSid, media: { payload: msg.delta } });
+            } else {
+              // streamSid not ready yet — buffer it
+              pendingAudio.push(msg.delta);
+            }
           }
           break;
 
@@ -136,7 +149,11 @@ app.ws("/media-stream/:callId", async (ws, req) => {
 
         case "input_audio_buffer.speech_stopped":
           console.log(`[${callId}] speech stopped`);
-          // server_vad handles commit+response automatically — don't manually trigger
+          break;
+
+        case "input_audio_buffer.committed":
+          console.log(`[${callId}] buffer committed — requesting response`);
+          xaiWs.send(JSON.stringify({ type: "response.create" }));
           break;
 
         case "session.updated":
