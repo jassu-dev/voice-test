@@ -47,9 +47,14 @@ async function handleToolCall(name: string, args: Record<string, any>): Promise<
 app.get("/health", (_req, res) => res.json({ status: "ok" }));
 
 app.post("/twiml", async (_req, res) => {
-  if (!process.env.HOSTNAME) { res.status(500).send("HOSTNAME not set"); return; }
+  if (!process.env.HOSTNAME) {
+    console.error("HOSTNAME env var is not set!");
+    res.status(500).send("Server misconfigured: HOSTNAME not set");
+    return;
+  }
   const callId = generateSecureId("call");
   const hostname = process.env.HOSTNAME.replace(/^https?:\/\//, "");
+  console.log(`[${callId}] TwiML request, stream URL: wss://${hostname}/media-stream/${callId}`);
   res.status(200).type("text/xml").end(
     `<Response><Connect><Stream url="wss://${hostname}/media-stream/${callId}" /></Connect></Response>`
   );
