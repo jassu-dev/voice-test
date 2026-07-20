@@ -53,7 +53,7 @@ app.post("/twiml", async (_req, res) => {
     return;
   }
   const callId = generateSecureId("call");
-  const hostname = process.env.HOSTNAME.replace(/^https?:\/\//, "");
+  const hostname = process.env.HOSTNAME.replace(/^https?:\/\//, "").replace(/\/$/, "");
   console.log(`[${callId}] TwiML request, stream URL: wss://${hostname}/media-stream/${callId}`);
   res.status(200).type("text/xml").end(
     `<Response><Connect><Stream url="wss://${hostname}/media-stream/${callId}" /></Connect></Response>`
@@ -247,7 +247,7 @@ app.ws("/media-stream/:callId", async (ws, req) => {
 const OUTBOUND_INSTRUCTIONS = `You are an outbound AI phone agent. YOU speak first. Greet warmly, keep replies short.`;
 
 app.post("/outbound-twiml", (_req, res) => {
-  const hostname = (process.env.HOSTNAME || "").replace(/^https?:\/\//, "");
+  const hostname = (process.env.HOSTNAME || "").replace(/^https?:\/\//, "").replace(/\/$/, "");
   res.type("text/xml").send(
     `<Response><Connect><Stream url="wss://${hostname}/outbound-stream" /></Connect></Response>`
   );
