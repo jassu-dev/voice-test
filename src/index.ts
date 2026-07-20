@@ -98,6 +98,7 @@ app.ws("/media-stream/:callId", async (ws, req) => {
   let sessionReady = false;
   let turnCount = 0;
   let turnActive = false;
+  let bargedIn = false;
 
   xaiWs.on("message", (data: Buffer, isBinary: boolean) => {
     // xAI sends audio as binary WebSocket frames
@@ -155,6 +156,7 @@ app.ws("/media-stream/:callId", async (ws, req) => {
 
         case "input_audio_buffer.speech_started":
           console.log(`[${callId}] barge-in`);
+          bargedIn = turnActive; // only a real barge-in if agent was speaking
           turnActive = false;
           if (tw.streamSid) tw.send({ event: "clear", streamSid: tw.streamSid });
           break;
@@ -165,6 +167,11 @@ app.ws("/media-stream/:callId", async (ws, req) => {
 
         case "input_audio_buffer.committed":
           console.log(`[${callId}] buffer committed`);
+          // Only send response.create after a barge-in — server_vad handles normal turns
+          if (bargedIn) {
+            bargedIn = false;
+            xaiWs.send(JSON.stringify({ type: "response.create" }));
+          }
           break;
 
         case "session.updated":
