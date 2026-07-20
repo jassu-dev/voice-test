@@ -81,7 +81,18 @@ app.ws("/media-stream/:callId", async (ws, req) => {
 
   const WebSocket = require("ws");
   const tw = new TwilioMediaStreamWebsocket(ws);
-  const pendingAudio: string[] = []; // audio arriving before streamSid is ready
+  const pendingAudio: string[] = [];
+
+  // Connect to xAI immediately — before Twilio start event
+  const xaiWs = new WebSocket(API_URL, {
+    headers: { Authorization: `Bearer ${XAI_API_KEY}` },
+  });
+
+  const xaiReady = new Promise<void>((resolve, reject) => {
+    const t = setTimeout(() => { xaiWs.close(); reject(new Error("xAI timeout")); }, 10000);
+    xaiWs.on("open", () => { clearTimeout(t); console.log(`[${callId}] xAI connected`); resolve(); });
+    xaiWs.on("error", (e: any) => { clearTimeout(t); reject(e); });
+  });
 
   tw.on("start", (msg) => {
     tw.streamSid = msg.start.streamSid;
@@ -94,16 +105,7 @@ app.ws("/media-stream/:callId", async (ws, req) => {
     }
   });
 
-  // Connect to xAI immediately
-  const xaiWs = new WebSocket(API_URL, {
-    headers: { Authorization: `Bearer ${XAI_API_KEY}` },
-  });
-
-  await new Promise<void>((resolve, reject) => {
-    const t = setTimeout(() => { xaiWs.close(); reject(new Error("xAI timeout")); }, 10000);
-    xaiWs.on("open", () => { clearTimeout(t); console.log(`[${callId}] xAI connected`); resolve(); });
-    xaiWs.on("error", (e: any) => { clearTimeout(t); reject(e); });
-  });
+  await xaiReady;
 
   let sessionReady = false;
   let turnCount = 0;
@@ -172,11 +174,9 @@ app.ws("/media-stream/:callId", async (ws, req) => {
       // After commit: if it was a barge-in, explicitly request response
       // For normal turns server_vad auto-requests — sending extra would double-trigger
       case "input_audio_buffer.committed":
-        console.log(`[${callId}] committed bargedIn=${bargedIn}`);
-        if (bargedIn) {
-          bargedIn = false;
-          xaiWs.send(JSON.stringify({ type: "response.create" }));
-        }
+        console.log(`[${callId}] committed`);
+        bargedIn = false;
+        xaiWs.send(JSON.stringify({ type: "response.create" }));
         break;
 
       // Session configured — send greeting via force_message (TTS only, no LLM delay)
