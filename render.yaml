@@ -2,7 +2,7 @@ services:
   - type: web
     name: xai-telephony
     env: node
-    region: oregon  # US West — close to xAI servers
+    region: ohio
     plan: free
     rootDir: .
     buildCommand: npm install && npm run build

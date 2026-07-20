@@ -105,8 +105,6 @@ app.ws("/media-stream/:callId", async (ws, req) => {
 
       if (msg.type !== "response.output_audio.delta") {
         console.log(`[${callId}] ${msg.type}`);
-      } else {
-        console.log(`[${callId}] audio delta len=${msg.delta?.length || 0} streamSid=${!!tw.streamSid}`);
       }
 
       switch (msg.type) {
@@ -182,7 +180,7 @@ app.ws("/media-stream/:callId", async (ws, req) => {
               turn_detection: {
                 type: "server_vad",
                 threshold: 0.85,
-                silence_duration_ms: 550,
+                silence_duration_ms: 400,
                 prefix_padding_ms: 200,
               },
               audio: {
@@ -269,7 +267,7 @@ app.ws("/outbound-stream", (ws: any) => {
               instructions: OUTBOUND_INSTRUCTIONS,
               voice: "rex",
               reasoning: { effort: "none" },
-              turn_detection: { type: "server_vad", threshold: 0.85, silence_duration_ms: 550, prefix_padding_ms: 200 },
+              turn_detection: { type: "server_vad", threshold: 0.85, silence_duration_ms: 400, prefix_padding_ms: 200 },
               audio: {
                 input:  { format: { type: "audio/pcmu" } },
                 output: { format: { type: "audio/pcmu" } },
