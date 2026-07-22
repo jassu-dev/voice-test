@@ -12,13 +12,13 @@ const API_URL = process.env.API_URL || "wss://api.x.ai/v1/realtime";
 const ENABLE_TOOLS = process.env.ENABLE_TOOLS !== "false";
 
 // ── VAD config — tune via env vars without touching code ──────────────────
-// Issue 1 Fix A: Raise threshold to 0.75 for real phone lines (noisy carriers)
-// Test: set VAD_THRESHOLD=0.7 first, call from real phone, check turn durations
-// If turns still stay open >2x actual speaking time, try VAD_THRESHOLD=0.75
+// For real phone/Twilio calls: threshold=0.85 (xAI default, tuned for telephony noise)
+// silence_duration_ms=600ms: natural pause without cutting off mid-sentence
+// To test: VAD_THRESHOLD=0.85 VAD_SILENCE_MS=600 in env
 const VAD_CONFIG = {
-  threshold: parseFloat(process.env.VAD_THRESHOLD || "0.75"),
-  silence_duration_ms: parseInt(process.env.VAD_SILENCE_MS || "800"),
-  prefix_padding_ms: parseInt(process.env.VAD_PREFIX_MS || "400"),
+  threshold: parseFloat(process.env.VAD_THRESHOLD || "0.85"),
+  silence_duration_ms: parseInt(process.env.VAD_SILENCE_MS || "600"),
+  prefix_padding_ms: parseInt(process.env.VAD_PREFIX_MS || "300"),
 };
 
 // Issue 2 Fix A: Debounce rapid-fire response.cancel sends
