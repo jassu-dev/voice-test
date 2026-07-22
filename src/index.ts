@@ -218,8 +218,14 @@ app.ws("/media-stream/:callId", async (ws: any, req) => {
       console.log(`${ts()} [${callId}] twilio ready sid=${streamSid} to=${phoneNumberDialed} from=${callerNumber} (+${Date.now() - callStartTime}ms)`);
       console.log(`${ts()} [${callId}] start payload: ${JSON.stringify(msg.start)}`);
       notifyCallStart(callId, phoneNumberDialed, callerNumber).then(data => {
-        if (data) { callUserId = data.user_id || ""; callInstructions = data.instructions || bot.instructions; }
-      }).catch(() => {});
+        if (data) {
+          callUserId = data.user_id || "";
+          callInstructions = data.instructions || bot.instructions;
+          console.log(`${ts()} [${callId}] account loaded user_id=${callUserId}`);
+        } else {
+          console.log(`${ts()} [${callId}] account lookup returned null — using default instructions`);
+        }
+      }).catch((e) => { console.log(`${ts()} [${callId}] account lookup error: ${e.message}`); });
       if (pendingAudio.length > 0) {
         for (const p of pendingAudio) ws.send(JSON.stringify({ event: "media", streamSid, media: { payload: p } }));
         pendingAudio.length = 0;
@@ -333,6 +339,8 @@ app.ws("/media-stream/:callId", async (ws: any, req) => {
         process.stdout.write("\n"); clearFillerTimer();
         if (currentAssistantTranscript && callUserId) logTranscript(callId, callUserId, "assistant", currentAssistantTranscript);
         currentAssistantTranscript = "";
+        // Guard against double-firing (response.done + response.cancelled both arrive sometimes)
+        if (!player.getActiveResponseId()) break;
         const rid = player.getActiveResponseId();
         const qf = player.getQueuedFrameCount();
         console.log(`${ts()} [${callId}] [PACING] generation done, ~${qf * 20}ms audio still playing`);
@@ -382,7 +390,12 @@ app.ws("/media-stream/:callId", async (ws: any, req) => {
         break;
       case "input_audio_buffer.committed":
         console.log(`${ts()} [${callId}] [LATENCY] committed — requesting response`);
-        startWatchdog(); xaiWs.send(JSON.stringify({ type: "response.create" }));
+        // Guard: don't send response.create if one is already in progress
+        if (!player.getActiveResponseId()) {
+          startWatchdog(); xaiWs.send(JSON.stringify({ type: "response.create" }));
+        } else {
+          console.log(`${ts()} [${callId}] committed but response already active — skipping`);
+        }
         break;
       case "conversation.item.truncated":
         console.log(`${ts()} [${callId}] item truncated at ${msg.audio_end_ms}ms`);
