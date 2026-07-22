@@ -11,11 +11,11 @@ const XAI_API_KEY = process.env.XAI_API_KEY || "";
 const API_URL = process.env.API_URL || "wss://api.x.ai/v1/realtime";
 const ENABLE_TOOLS = process.env.ENABLE_TOOLS !== "false";
 
-// ── VAD config — tune via env vars without touching code ──────────────────
+// ── VAD config — tune via env vars ────────────────────────────────────────
 const VAD_CONFIG = {
   threshold: parseFloat(process.env.VAD_THRESHOLD || "0.6"),
-  silence_duration_ms: parseInt(process.env.VAD_SILENCE_MS || "650"), // bumped from 500→650
-  prefix_padding_ms: parseInt(process.env.VAD_PREFIX_MS || "300"),
+  silence_duration_ms: parseInt(process.env.VAD_SILENCE_MS || "800"),   // bumped 650→800
+  prefix_padding_ms: parseInt(process.env.VAD_PREFIX_MS || "400"),      // bumped 300→400
 };
 
 function generateSecureId(prefix: string): string {
@@ -25,6 +25,57 @@ function generateSecureId(prefix: string): string {
 function ts(): string {
   return new Date().toISOString().slice(11, 23); // HH:MM:SS.mmm
 }
+
+// ── Pre-warm xAI WebSocket pool ───────────────────────────────────────────
+// We keep one warm xAI connection ready so the first call has near-zero
+// connect latency. When a call consumes it, we immediately pre-warm another.
+interface WarmConnection {
+  ws: any;
+  ready: boolean;
+  createdAt: number;
+}
+
+let warmPool: WarmConnection | null = null;
+const MAX_WARM_AGE_MS = 55000; // xAI WS idle timeout ~60s; recycle before that
+
+function createWarmConnection(): WarmConnection {
+  const WebSocket = require("ws");
+  const conn: WarmConnection = {
+    ws: new WebSocket(API_URL, { headers: { Authorization: `Bearer ${XAI_API_KEY}` } }),
+    ready: false,
+    createdAt: Date.now(),
+  };
+  conn.ws.on("open", () => { conn.ready = true; });
+  conn.ws.on("error", () => { if (warmPool === conn) warmPool = null; });
+  conn.ws.on("close", () => { if (warmPool === conn) warmPool = null; });
+  return conn;
+}
+
+function getOrCreateWarmWs(): Promise<any> {
+  const WebSocket = require("ws");
+  const now = Date.now();
+
+  // Use warm connection if ready and fresh
+  if (warmPool && warmPool.ready && (now - warmPool.createdAt) < MAX_WARM_AGE_MS) {
+    const ws = warmPool.ws;
+    warmPool = null;
+    // Pre-warm next immediately
+    setTimeout(() => { warmPool = createWarmConnection(); }, 0);
+    return Promise.resolve(ws);
+  }
+
+  // No warm connection — connect now (normal path, ~200-400ms)
+  console.log(`${ts()} [pool] no warm connection — connecting now`);
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(API_URL, { headers: { Authorization: `Bearer ${XAI_API_KEY}` } });
+    const t = setTimeout(() => { ws.close(); reject(new Error("xAI connect timeout")); }, 10000);
+    ws.on("open", () => { clearTimeout(t); resolve(ws); });
+    ws.on("error", (e: any) => { clearTimeout(t); reject(e); });
+  });
+}
+
+// Seed the warm pool at startup
+warmPool = createWarmConnection();
 
 const tools = [
   {
@@ -54,13 +105,14 @@ async function handleToolCall(name: string, args: Record<string, any>): Promise<
   }
 }
 
-// ── Audio Playback Manager ─────────────────────────────────────────────────
+// ── Audio Playback Manager ────────────────────────────────────────────────
 // mulaw 8kHz: 8000 bytes/sec = 8 bytes/ms
 class AudioPlayer {
   private queue: Array<{ payload: string; bytes: number }> = [];
   private activeResponseId: string | null = null;
   private playedMs: number = 0;
   private firstChunkPlayed: boolean = false;
+  private outputItemAdded: boolean = false; // for false-start detection
   private sendFn: (payload: string) => void;
   private callId: string;
 
@@ -73,22 +125,26 @@ class AudioPlayer {
     this.activeResponseId = responseId;
     this.playedMs = 0;
     this.firstChunkPlayed = false;
+    this.outputItemAdded = false;
     this.queue = [];
   }
 
+  markOutputItem() { this.outputItemAdded = true; }
+  hadOutputItem() { return this.outputItemAdded; }
+
   play(payload: string, responseId: string) {
-    if (responseId !== this.activeResponseId) return; // discard stale delta
+    if (responseId !== this.activeResponseId) return;
     const bytes = Buffer.from(payload, "base64").length;
     this.queue.push({ payload, bytes });
     this.flush();
   }
 
-  // Returns playedMs; clears queue and activeResponseId
   interrupt(): number {
     const played = this.playedMs;
     this.queue = [];
     this.activeResponseId = null;
     this.firstChunkPlayed = false;
+    this.outputItemAdded = false;
     return played;
   }
 
@@ -97,6 +153,7 @@ class AudioPlayer {
     this.activeResponseId = null;
     this.playedMs = 0;
     this.firstChunkPlayed = false;
+    this.outputItemAdded = false;
   }
 
   getActiveResponseId(): string | null { return this.activeResponseId; }
@@ -132,26 +189,24 @@ app.post("/call-status", (_req, res) => res.status(200).send());
 // ── Inbound Media Stream ───────────────────────────────────────────────────
 app.ws("/media-stream/:callId", async (ws: any, req) => {
   const callId = req.params.callId as string;
+  const callStartTime = Date.now();
   console.log(`${ts()} [${callId}] CALL STARTED`);
 
-  const WebSocket = require("ws");
   let streamSid = "";
   let sessionReady = false;
   let currentItemId: string | null = null;
   const pendingAudio: string[] = [];
   let micChunkCount = 0;
+  let lastCancelledResponseId: string | null = null;
+  let lastCancelTimestamp = 0;
+  const FALSE_START_WINDOW_MS = 400; // responses created within this window of a cancel
 
-  // Watchdog: fires if response.created doesn't arrive within 2500ms of commit
   let commitWatchdog: ReturnType<typeof setTimeout> | null = null;
-
-  const clearWatchdog = () => {
-    if (commitWatchdog) { clearTimeout(commitWatchdog); commitWatchdog = null; }
-  };
-
+  const clearWatchdog = () => { if (commitWatchdog) { clearTimeout(commitWatchdog); commitWatchdog = null; } };
   const startWatchdog = () => {
     clearWatchdog();
     commitWatchdog = setTimeout(() => {
-      console.log(`${ts()} [${callId}] [WATCHDOG] no response.created within 2500ms of commit — possible silent drop`);
+      console.log(`${ts()} [${callId}] [WATCHDOG] no response.created within 2500ms of commit`);
     }, 2500);
   };
 
@@ -167,14 +222,14 @@ app.ws("/media-stream/:callId", async (ws: any, req) => {
 
   const player = new AudioPlayer(callId, sendToTwilio);
 
-  // ── Twilio handler registered FIRST — never misses start event ───────────
+  // ── Register Twilio handler FIRST — before any await ────────────────────
   ws.on("message", (raw: string) => {
     let msg: any;
     try { msg = JSON.parse(raw.toString()); } catch { return; }
 
     if (msg.event === "start") {
       streamSid = msg.start.streamSid;
-      console.log(`${ts()} [${callId}] twilio ready sid=${streamSid}`);
+      console.log(`${ts()} [${callId}] twilio ready sid=${streamSid} (+${Date.now() - callStartTime}ms)`);
       if (pendingAudio.length > 0) {
         console.log(`${ts()} [${callId}] flushing ${pendingAudio.length} buffered chunks`);
         for (const p of pendingAudio) {
@@ -186,11 +241,8 @@ app.ws("/media-stream/:callId", async (ws: any, req) => {
     } else if (msg.event === "media") {
       if (msg.media?.track !== "inbound") return;
       if (!sessionReady || xaiWs.readyState !== 1) return;
-      if (micChunkCount === 0) {
-        console.log(`${ts()} [${callId}] [LATENCY] first mic chunk → xAI`);
-      }
+      if (micChunkCount === 0) console.log(`${ts()} [${callId}] [LATENCY] first mic chunk → xAI`);
       micChunkCount++;
-      // Stream continuously — no client-side gating, let server_vad decide
       xaiWs.send(JSON.stringify({ type: "input_audio_buffer.append", audio: msg.media.payload }));
 
     } else if (msg.event === "stop") {
@@ -202,20 +254,15 @@ app.ws("/media-stream/:callId", async (ws: any, req) => {
 
   ws.on("close", () => { clearWatchdog(); try { xaiWs.close(); } catch {} });
 
-  // ── Connect xAI ──────────────────────────────────────────────────────────
-  const xaiWs = new WebSocket(API_URL, {
-    headers: { Authorization: `Bearer ${XAI_API_KEY}` },
+  // ── FIX A: Get warm xAI connection — started in parallel with Twilio setup
+  console.log(`${ts()} [${callId}] [CONNECT-ATTEMPT-START] acquiring xAI WebSocket`);
+  const connectStart = Date.now();
+  const xaiWs = await getOrCreateWarmWs().catch(e => {
+    console.log(`${ts()} [${callId}] xAI connect failed: ${e.message}`);
+    ws.close();
+    throw e;
   });
-
-  await new Promise<void>((resolve, reject) => {
-    const t = setTimeout(() => { xaiWs.close(); reject(new Error("xAI timeout")); }, 10000);
-    xaiWs.on("open", () => {
-      clearTimeout(t);
-      console.log(`${ts()} [${callId}] xAI connected`);
-      resolve();
-    });
-    xaiWs.on("error", (e: any) => { clearTimeout(t); reject(e); });
-  });
+  console.log(`${ts()} [${callId}] xAI connected (+${Date.now() - connectStart}ms from attempt, +${Date.now() - callStartTime}ms total)`);
 
   // ── xAI message handler ───────────────────────────────────────────────────
   xaiWs.on("message", (data: Buffer, isBinary: boolean) => {
@@ -230,48 +277,56 @@ app.ws("/media-stream/:callId", async (ws: any, req) => {
     try { msg = JSON.parse(data.toString()); } catch { return; }
 
     const quiet = ["response.output_audio.delta", "response.output_audio_transcript.delta"];
-    if (!quiet.includes(msg.type)) {
-      console.log(`${ts()} [${callId}] ${msg.type}`);
-    }
+    if (!quiet.includes(msg.type)) console.log(`${ts()} [${callId}] ${msg.type}`);
 
     switch (msg.type) {
 
-      // ── FIX #1: Error logging — always first ─────────────────────────────
       case "error":
         console.log(`${ts()} [${callId}] [SERVER-ERROR] ${JSON.stringify(msg)}`);
         break;
 
-      // ── Audio: stream each delta immediately ─────────────────────────────
       case "response.output_audio.delta":
-        if (msg.delta && msg.response_id) {
-          player.play(msg.delta, msg.response_id);
-        }
+        if (msg.delta && msg.response_id) player.play(msg.delta, msg.response_id);
         break;
 
       case "response.output_audio_transcript.delta":
         process.stdout.write(msg.delta || "");
         break;
 
-      // ── FIX #4: Track activeResponseId using actual id, not a boolean ────
-      case "response.created":
-        clearWatchdog(); // response arrived — watchdog no longer needed
-        console.log(`${ts()} [${callId}] [LATENCY] response.created id=${msg.response?.id}`);
-        player.setResponse(msg.response?.id || "");
+      case "response.created": {
+        clearWatchdog();
+        const rid = msg.response?.id || "";
+        const now = Date.now();
+        // False-start detection: new response within cooldown of a cancel
+        if (
+          lastCancelledResponseId &&
+          (now - lastCancelTimestamp) < FALSE_START_WINDOW_MS
+        ) {
+          console.log(`${ts()} [${callId}] [FALSE-START] response_id=${rid} created ${now - lastCancelTimestamp}ms after cancel of ${lastCancelledResponseId}`);
+        }
+        console.log(`${ts()} [${callId}] [LATENCY] response.created id=${rid} (+${Date.now() - callStartTime}ms total)`);
+        player.setResponse(rid);
         break;
+      }
 
       case "response.output_item.added":
         if (msg.item?.type === "message" && msg.item?.role === "assistant") {
           currentItemId = msg.item.id;
+          player.markOutputItem();
         }
         break;
 
       case "response.done":
-      case "response.cancelled":
+      case "response.cancelled": {
         process.stdout.write("\n");
+        const rid = player.getActiveResponseId();
+        if (rid && !player.hadOutputItem()) {
+          console.log(`${ts()} [${callId}] [FALSE-START] response_id=${rid} ended with no output`);
+        }
         player.clear();
         break;
+      }
 
-      // ── Transcription — confirms what server actually received ────────────
       case "conversation.item.input_audio_transcription.completed":
         console.log(`${ts()} [${callId}] [TRANSCRIPTION] "${msg.transcript}"`);
         break;
@@ -280,23 +335,15 @@ app.ws("/media-stream/:callId", async (ws: any, req) => {
         console.log(`${ts()} [${callId}] [TRANSCRIPTION-UPDATE] "${msg.transcript}"`);
         break;
 
-      // ── FIX #2 + #3: Barge-in only fires when there's an active response ─
       case "input_audio_buffer.speech_started": {
         const activeRid = player.getActiveResponseId();
-
         if (activeRid !== null) {
-          // Real barge-in: agent was speaking, caller interrupted
           const playedMs = player.interrupt();
           console.log(`${ts()} [${callId}] [BARGE-IN] cancelling response_id=${activeRid} played=${playedMs}ms`);
-
-          // 1. Stop Twilio playback instantly
           if (streamSid) ws.send(JSON.stringify({ event: "clear", streamSid }));
-
-          // 2. Cancel server response generation
-          // FIX #4: only send cancel for the response_id we're interrupting
           xaiWs.send(JSON.stringify({ type: "response.cancel" }));
-
-          // 3. Truncate history to what caller actually heard
+          lastCancelledResponseId = activeRid;
+          lastCancelTimestamp = Date.now();
           if (currentItemId && playedMs > 0) {
             xaiWs.send(JSON.stringify({
               type: "conversation.item.truncate",
@@ -306,7 +353,6 @@ app.ws("/media-stream/:callId", async (ws: any, req) => {
             }));
           }
         } else {
-          // Normal turn start — nothing was playing, do NOT send cancel/truncate
           console.log(`${ts()} [${callId}] [speech_started] no active response — normal turn`);
         }
         break;
@@ -316,11 +362,9 @@ app.ws("/media-stream/:callId", async (ws: any, req) => {
         console.log(`${ts()} [${callId}] [LATENCY] speech_stopped`);
         break;
 
-      // ── FIX #3: Watchdog starts on commit ────────────────────────────────
       case "input_audio_buffer.committed":
-        console.log(`${ts()} [${callId}] [LATENCY] buffer committed — requesting response`);
-        startWatchdog(); // cleared when response.created arrives
-        // No artificial delay — request response immediately
+        console.log(`${ts()} [${callId}] [LATENCY] committed — requesting response`);
+        startWatchdog();
         xaiWs.send(JSON.stringify({ type: "response.create" }));
         break;
 
@@ -328,9 +372,11 @@ app.ws("/media-stream/:callId", async (ws: any, req) => {
         console.log(`${ts()} [${callId}] item truncated at ${msg.audio_end_ms}ms`);
         break;
 
+      // ── FIX C: Greeting via force_message — no model round-trip ─────────
       case "session.updated":
         sessionReady = true;
-        console.log(`${ts()} [${callId}] session ready — threshold=${VAD_CONFIG.threshold} silence=${VAD_CONFIG.silence_duration_ms}ms`);
+        console.log(`${ts()} [${callId}] session ready (+${Date.now() - callStartTime}ms total)`);
+        // force_message = TTS synthesis only, bypasses model generation entirely
         xaiWs.send(JSON.stringify({
           type: "conversation.item.create",
           item: {
@@ -340,19 +386,21 @@ app.ws("/media-stream/:callId", async (ws: any, req) => {
             content: [{ type: "output_text", text: "Hey! How can I help you today?" }],
           },
         }));
+        console.log(`${ts()} [${callId}] [SEND] force_message greeting dispatched`);
         break;
 
+      // ── FIX B: session.update sent immediately on conversation.created ───
+      // No blocking work here — bot.instructions is a static string,
+      // no DB/CRM calls, so this fires instantly after conversation.created
       case "conversation.created":
+        console.log(`${ts()} [${callId}] [SEND] session.update dispatched`);
         xaiWs.send(JSON.stringify({
           type: "session.update",
           session: {
             instructions: bot.instructions,
             voice: "celeste",
             reasoning: { effort: "none" },
-            turn_detection: {
-              type: "server_vad",
-              ...VAD_CONFIG,
-            },
+            turn_detection: { type: "server_vad", ...VAD_CONFIG },
             audio: {
               input: {
                 format: { type: "audio/pcmu" },
@@ -375,7 +423,6 @@ app.ws("/media-stream/:callId", async (ws: any, req) => {
               type: "conversation.item.create",
               item: { type: "function_call_output", call_id: msg.item.call_id, output: result },
             }));
-            // Wait for current playback to finish before next response
             const waitForPlayback = () => new Promise<void>(res => {
               const check = () => {
                 if (!player.getActiveResponseId()) { res(); return; }
@@ -416,6 +463,9 @@ app.ws("/outbound-stream", (ws: any) => {
   let currentResponseId: string | null = null;
   let currentItemId: string | null = null;
   let playedMs = 0;
+  let outputItemAdded = false;
+  let lastCancelledResponseId: string | null = null;
+  let lastCancelTimestamp = 0;
   let commitWatchdog: ReturnType<typeof setTimeout> | null = null;
 
   ws.on("message", (raw: string) => {
@@ -430,6 +480,7 @@ app.ws("/outbound-stream", (ws: any) => {
       xaiWs = new WebSocket(API_URL, { headers: { Authorization: `Bearer ${XAI_API_KEY}` } });
 
       xaiWs.on("open", () => {
+        console.log(`${ts()} [OUTBOUND][${callSid}] [SEND] session.update dispatched`);
         xaiWs.send(JSON.stringify({
           type: "session.update",
           session: {
@@ -459,9 +510,7 @@ app.ws("/outbound-stream", (ws: any) => {
         }
         let m: any;
         try { m = JSON.parse(d.toString()); } catch { return; }
-        if (m.type !== "response.output_audio.delta") {
-          console.log(`${ts()} [OUTBOUND][${callSid}] ${m.type}`);
-        }
+        if (m.type !== "response.output_audio.delta") console.log(`${ts()} [OUTBOUND][${callSid}] ${m.type}`);
 
         switch (m.type) {
           case "error":
@@ -471,14 +520,23 @@ app.ws("/outbound-stream", (ws: any) => {
             sessionReady = true;
             xaiWs.send(JSON.stringify({ type: "response.create" }));
             break;
-          case "response.created":
+          case "response.created": {
             if (commitWatchdog) { clearTimeout(commitWatchdog); commitWatchdog = null; }
+            const now = Date.now();
+            if (lastCancelledResponseId && (now - lastCancelTimestamp) < 400) {
+              console.log(`${ts()} [OUTBOUND][${callSid}] [FALSE-START] response_id=${m.response?.id} created ${now - lastCancelTimestamp}ms after cancel`);
+            }
             turnCount++;
             currentResponseId = m.response?.id || null;
             playedMs = 0;
+            outputItemAdded = false;
             break;
+          }
           case "response.output_item.added":
-            if (m.item?.type === "message" && m.item?.role === "assistant") currentItemId = m.item.id;
+            if (m.item?.type === "message" && m.item?.role === "assistant") {
+              currentItemId = m.item.id;
+              outputItemAdded = true;
+            }
             break;
           case "response.output_audio.delta":
             if (m.delta && m.response_id === currentResponseId && streamSid) {
@@ -488,6 +546,9 @@ app.ws("/outbound-stream", (ws: any) => {
             break;
           case "response.done":
           case "response.cancelled":
+            if (currentResponseId && !outputItemAdded) {
+              console.log(`${ts()} [OUTBOUND][${callSid}] [FALSE-START] response_id=${currentResponseId} ended with no output`);
+            }
             currentResponseId = null;
             if (turnCount >= MAX_TURNS) setTimeout(() => { xaiWs?.close(); ws.close(); }, 3000);
             break;
@@ -497,6 +558,8 @@ app.ws("/outbound-stream", (ws: any) => {
               const pms = playedMs;
               console.log(`${ts()} [OUTBOUND][${callSid}] [BARGE-IN] cancelling response_id=${rid} played=${pms}ms`);
               currentResponseId = null;
+              lastCancelledResponseId = rid;
+              lastCancelTimestamp = Date.now();
               if (streamSid) ws.send(JSON.stringify({ event: "clear", streamSid }));
               xaiWs.send(JSON.stringify({ type: "response.cancel" }));
               if (currentItemId && pms > 0) {
@@ -514,7 +577,7 @@ app.ws("/outbound-stream", (ws: any) => {
           }
           case "input_audio_buffer.committed":
             commitWatchdog = setTimeout(() => {
-              console.log(`${ts()} [OUTBOUND][${callSid}] [WATCHDOG] no response.created within 2500ms of commit`);
+              console.log(`${ts()} [OUTBOUND][${callSid}] [WATCHDOG] no response.created within 2500ms`);
             }, 2500);
             xaiWs.send(JSON.stringify({ type: "response.create" }));
             break;
@@ -545,4 +608,6 @@ const port = process.env.PORT || "3000";
 app.listen(port, () => {
   console.log(`Server on http://localhost:${port}`);
   console.log(`VAD: threshold=${VAD_CONFIG.threshold} silence=${VAD_CONFIG.silence_duration_ms}ms prefix=${VAD_CONFIG.prefix_padding_ms}ms`);
+  // Warm pool is seeded at module load — first call should connect instantly
+  console.log(`xAI warm pool: seeded`);
 });
