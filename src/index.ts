@@ -97,24 +97,22 @@ async function handleToolCall(name: string, args: Record<string, any>): Promise<
 }
 
 
-// ── Audio Playback Manager (real-time paced) ──────────────────────────────
-// Twilio expects µ-law 8kHz audio at real-time pace.
-// Standard frame: 160 bytes = 20ms of audio at 8kHz.
-// Previous implementation flushed all queued chunks in a tight loop,
-// sending 13s of audio in ~2.6s — activeResponseId cleared way before
-// the caller finished hearing the response, breaking barge-in detection.
-// This version paces outbound frames at exactly 20ms/frame via setInterval.
+// ── Audio Playback Manager (wall-clock paced state tracking) ─────────────
+// Audio is sent to Twilio immediately as deltas arrive (no setInterval jitter).
+// We track playback state via wall clock so activeResponseId stays non-null
+// for the real duration of audible playback, enabling correct barge-in detection.
+// mulaw 8kHz: 8000 bytes/sec = 8 bytes/ms
 class AudioPlayer {
-  private frameQueue: Buffer[] = [];
   private activeResponseId: string | null = null;
-  private playedMs: number = 0;
+  private totalQueuedBytes: number = 0;    // total bytes enqueued this response
+  private playbackStartedAt: number = 0;   // wall clock when first frame sent
   private outputItemAdded: boolean = false;
-  private paceTimer: ReturnType<typeof setInterval> | null = null;
+  private generationDoneAt: number = 0;    // when response.done arrived
   private onDrained: (() => void) | null = null;
+  private drainTimer: ReturnType<typeof setTimeout> | null = null;
   private sendFn: (payload: string) => void;
   private callId: string;
-  private readonly FRAME_MS = 20;
-  private readonly FRAME_BYTES = 160; // 8kHz mulaw, 20ms per frame
+  private firstChunkLogged: boolean = false;
 
   constructor(callId: string, sendFn: (payload: string) => void) {
     this.callId = callId;
@@ -122,80 +120,88 @@ class AudioPlayer {
   }
 
   setResponse(responseId: string) {
+    this.stopDrainTimer();
     this.activeResponseId = responseId;
-    this.playedMs = 0;
+    this.totalQueuedBytes = 0;
+    this.playbackStartedAt = 0;
     this.outputItemAdded = false;
-    this.frameQueue = [];
-    this.startPacing();
+    this.generationDoneAt = 0;
+    this.onDrained = null;
+    this.firstChunkLogged = false;
   }
 
   markOutputItem() { this.outputItemAdded = true; }
   hadOutputItem() { return this.outputItemAdded; }
-  getQueuedFrameCount() { return this.frameQueue.length; }
+  getQueuedFrameCount() { return Math.ceil(this.totalQueuedBytes / 160); }
 
-  // Chop incoming delta into 160-byte frames and enqueue for paced delivery
+  // Send immediately — no pacing timer, no jitter
   enqueue(base64Payload: string, responseId: string) {
     if (responseId !== this.activeResponseId) return;
     const bytes = Buffer.from(base64Payload, "base64");
-    for (let i = 0; i < bytes.length; i += this.FRAME_BYTES) {
-      this.frameQueue.push(bytes.subarray(i, i + this.FRAME_BYTES));
-    }
-  }
-
-  private startPacing() {
-    this.stopPacing();
-    this.paceTimer = setInterval(() => {
-      const frame = this.frameQueue.shift();
-      if (frame) {
-        this.sendFn(frame.toString("base64"));
-        this.playedMs += this.FRAME_MS;
-      } else if (this.onDrained) {
-        // Queue empty AND generation is done — playback genuinely finished
-        const cb = this.onDrained;
-        this.onDrained = null;
-        this.stopPacing();
-        cb();
+    if (this.playbackStartedAt === 0) {
+      this.playbackStartedAt = Date.now();
+      if (!this.firstChunkLogged) {
+        console.log(`${ts()} [${this.callId}] [LATENCY] first audio chunk → Twilio`);
+        this.firstChunkLogged = true;
       }
-    }, this.FRAME_MS);
+    }
+    this.totalQueuedBytes += bytes.length;
+    this.sendFn(base64Payload); // send immediately — Twilio buffers and plays at correct rate
   }
 
-  private stopPacing() {
-    if (this.paceTimer) { clearInterval(this.paceTimer); this.paceTimer = null; }
+  // Returns estimated ms actually played so far (wall clock based)
+  getPlayedMs(): number {
+    if (this.playbackStartedAt === 0) return 0;
+    const elapsed = Date.now() - this.playbackStartedAt;
+    const totalPlaybackMs = Math.round(this.totalQueuedBytes / 8); // 8 bytes/ms at 8kHz
+    return Math.min(elapsed, totalPlaybackMs); // can't have played more than total
   }
 
-  // Call on response.done — do NOT clear state immediately.
-  // If queue still has frames, defer cleanup until they drain (real playback done).
+  getActiveResponseId(): string | null { return this.activeResponseId; }
+
+  // Called on response.done — schedule cleanup after actual playback duration
   markGenerationDone(onActuallyDone: () => void) {
-    if (this.frameQueue.length === 0) {
-      this.stopPacing();
+    this.generationDoneAt = Date.now();
+    const totalPlaybackMs = Math.round(this.totalQueuedBytes / 8);
+    const alreadyElapsed = this.playbackStartedAt > 0 ? Date.now() - this.playbackStartedAt : 0;
+    const remainingMs = Math.max(0, totalPlaybackMs - alreadyElapsed);
+    console.log(`${ts()} [${this.callId}] [PACING] generation done, ~${Math.round(remainingMs)}ms of audio still playing`);
+    if (remainingMs <= 0) {
       onActuallyDone();
     } else {
       this.onDrained = onActuallyDone;
+      this.drainTimer = setTimeout(() => {
+        this.drainTimer = null;
+        this.onDrained = null;
+        onActuallyDone();
+      }, remainingMs + 100); // +100ms buffer for network jitter
     }
   }
 
-  // Hard interrupt: stop pacing immediately, drop all remaining frames
+  // Hard interrupt — stop tracking, cancel pending drain timer
   interrupt(): number {
-    const played = this.playedMs;
-    this.frameQueue = [];
-    this.onDrained = null;
-    this.stopPacing();
+    const played = this.getPlayedMs();
+    this.stopDrainTimer();
     this.activeResponseId = null;
     this.outputItemAdded = false;
+    this.onDrained = null;
     return played;
   }
 
   clear() {
-    this.frameQueue = [];
-    this.onDrained = null;
-    this.stopPacing();
+    this.stopDrainTimer();
     this.activeResponseId = null;
-    this.playedMs = 0;
+    this.totalQueuedBytes = 0;
+    this.playbackStartedAt = 0;
     this.outputItemAdded = false;
+    this.generationDoneAt = 0;
+    this.onDrained = null;
+    this.firstChunkLogged = false;
   }
 
-  getActiveResponseId(): string | null { return this.activeResponseId; }
-  getPlayedMs(): number { return this.playedMs; }
+  private stopDrainTimer() {
+    if (this.drainTimer) { clearTimeout(this.drainTimer); this.drainTimer = null; }
+  }
 }
 
 app.get("/health", (_req, res) => res.json({ status: "ok", vad: VAD_CONFIG, cancelDebounce: CANCEL_DEBOUNCE_MS, fillerThreshold: FILLER_THRESHOLD_MS }));
@@ -326,10 +332,7 @@ app.ws("/media-stream/:callId", async (ws: any, req) => {
     if (isBinary) {
       const payload = data.toString("base64");
       const rid = player.getActiveResponseId() || "";
-      if (player.getQueuedFrameCount() === 0 && player.getPlayedMs() === 0) {
-        console.log(`${ts()} [${callId}] [LATENCY] first binary audio frame → paced queue`);
-        clearFillerTimer();
-      }
+      clearFillerTimer();
       player.enqueue(payload, rid);
       return;
     }
@@ -355,10 +358,6 @@ app.ws("/media-stream/:callId", async (ws: any, req) => {
 
       case "response.output_audio.delta":
         if (msg.delta && msg.response_id) {
-          // First frame enqueued — log latency marker
-          if (player.getQueuedFrameCount() === 0 && player.getPlayedMs() === 0) {
-            console.log(`${ts()} [${callId}] [LATENCY] first audio delta → paced queue`);
-          }
           clearFillerTimer();
           player.enqueue(msg.delta, msg.response_id);
         }
@@ -548,37 +547,33 @@ app.ws("/outbound-stream", (ws: any) => {
 
       xaiWs = new WebSocket(API_URL, { headers: { Authorization: `Bearer ${XAI_API_KEY}` } });
 
-      // Outbound paced audio state
-      const FRAME_MS = 20, FRAME_BYTES = 160;
-      let outFrameQueue: Buffer[] = [];
-      let outPaceTimer: ReturnType<typeof setInterval> | null = null;
-      let outOnDrained: (() => void) | null = null;
-
-      const startOutPacing = () => {
-        if (outPaceTimer) return;
-        outPaceTimer = setInterval(() => {
-          const frame = outFrameQueue.shift();
-          if (frame && streamSid) {
-            ws.send(JSON.stringify({ event: "media", streamSid, media: { payload: frame.toString("base64") } }));
-            playedMs += FRAME_MS;
-          } else if (!frame && outOnDrained) {
-            const cb = outOnDrained; outOnDrained = null;
-            clearInterval(outPaceTimer!); outPaceTimer = null;
-            cb();
-          }
-        }, FRAME_MS);
-      };
+      // Outbound wall-clock audio state (no setInterval — avoids jitter)
+      const BYTES_PER_MS = 8; // 8kHz mulaw
+      let outTotalBytes = 0;
+      let outPlaybackStartedAt = 0;
+      let outDrainTimer: ReturnType<typeof setTimeout> | null = null;
 
       const enqueueOutAudio = (base64Payload: string, responseId: string) => {
         if (responseId !== currentResponseId) return;
         const bytes = Buffer.from(base64Payload, "base64");
-        for (let i = 0; i < bytes.length; i += FRAME_BYTES) outFrameQueue.push(bytes.subarray(i, i + FRAME_BYTES));
-        startOutPacing();
+        if (outPlaybackStartedAt === 0) outPlaybackStartedAt = Date.now();
+        outTotalBytes += bytes.length;
+        if (streamSid) ws.send(JSON.stringify({ event: "media", streamSid, media: { payload: base64Payload } }));
+        playedMs = Math.min(Date.now() - outPlaybackStartedAt, Math.round(outTotalBytes / BYTES_PER_MS));
       };
 
       const interruptOutAudio = () => {
-        outFrameQueue = []; outOnDrained = null;
-        if (outPaceTimer) { clearInterval(outPaceTimer); outPaceTimer = null; }
+        if (outDrainTimer) { clearTimeout(outDrainTimer); outDrainTimer = null; }
+        outTotalBytes = 0; outPlaybackStartedAt = 0;
+      };
+
+      const markOutGenerationDone = (onDone: () => void) => {
+        const totalMs = Math.round(outTotalBytes / BYTES_PER_MS);
+        const elapsed = outPlaybackStartedAt > 0 ? Date.now() - outPlaybackStartedAt : 0;
+        const remaining = Math.max(0, totalMs - elapsed);
+        console.log(`${ts()} [OUTBOUND][${callSid}] [PACING] generation done, ~${remaining}ms of audio still playing`);
+        if (remaining <= 0) { onDone(); }
+        else { outDrainTimer = setTimeout(() => { outDrainTimer = null; onDone(); }, remaining + 100); }
       };
       xaiWs.on("open", () => {
         console.log(`${ts()} [OUTBOUND][${callSid}] [SEND] session.update dispatched`);
@@ -623,16 +618,13 @@ app.ws("/outbound-stream", (ws: any) => {
             }
             break;
           case "response.done": case "response.cancelled": {
-            const qf = outFrameQueue.length;
-            console.log(`${ts()} [OUTBOUND][${callSid}] [PACING] generation done, ${qf} frames (${qf * 20}ms) queued`);
             const doneRid = currentResponseId;
-            outOnDrained = () => {
+            markOutGenerationDone(() => {
               if (doneRid && !outputItemAdded) console.log(`${ts()} [OUTBOUND][${callSid}] [FALSE-START] response_id=${doneRid} ended with no output`);
               currentResponseId = null;
               console.log(`${ts()} [OUTBOUND][${callSid}] [PACING] playback complete`);
               if (turnCount >= MAX_TURNS) setTimeout(() => { xaiWs?.close(); ws.close(); }, 3000);
-            };
-            if (outFrameQueue.length === 0) { const cb = outOnDrained; outOnDrained = null; if (outPaceTimer) { clearInterval(outPaceTimer); outPaceTimer = null; } cb(); }
+            });
             break;
           }
           case "input_audio_buffer.speech_started": {
