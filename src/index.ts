@@ -13,15 +13,17 @@ const ENABLE_TOOLS = process.env.ENABLE_TOOLS !== "false";
 
 // ── Tunable config — all via env vars, no code changes needed ────────────
 const VAD_CONFIG = {
-  threshold: parseFloat(process.env.VAD_THRESHOLD || "0.5"),
-  silence_duration_ms: parseInt(process.env.VAD_SILENCE_MS || "450"),
-  prefix_padding_ms: parseInt(process.env.VAD_PREFIX_MS || "250"),
+  threshold: parseFloat(process.env.VAD_THRESHOLD || "0.75"),
+  // 650ms: slightly snappier than 800ms, still handles natural mid-sentence pauses
+  // Try 700ms if callers get cut off; try 600ms if turns still feel slow
+  silence_duration_ms: parseInt(process.env.VAD_SILENCE_MS || "650"),
+  prefix_padding_ms: parseInt(process.env.VAD_PREFIX_MS || "400"),
 };
 
 const CANCEL_DEBOUNCE_MS = parseInt(process.env.CANCEL_DEBOUNCE_MS || "250");
 
-// Filler: 350ms = fires sooner on slow turns without triggering on fast ones
-const FILLER_THRESHOLD_MS = parseInt(process.env.FILLER_THRESHOLD_MS || "350");
+// Filler: 800ms — only fires on genuinely slow turns; 550ms was too aggressive
+const FILLER_THRESHOLD_MS = parseInt(process.env.FILLER_THRESHOLD_MS || "800");
 const FILLER_PHRASES = ["Mm-hmm,", "Let me see,", "Sure,"];
 
 // Voice: test rigel, naksh, lumen, celeste on real 8kHz phone lines
@@ -403,16 +405,20 @@ app.ws("/media-stream/:callId", async (ws: any, req) => {
         player.setResponse(rid);
 
         // Issue 3 Fix B: filler injection if no audio within FILLER_THRESHOLD_MS
+        // Only arm for real LLM responses — guard against re-arming on force_message turns
         clearFillerTimer();
+        const fillerRid = rid;
         fillerTimer = setTimeout(() => {
           fillerTimer = null;
-          if (player.getActiveResponseId() === rid) {
+          // Only inject if this is still the active response AND no audio has played yet
+          if (player.getActiveResponseId() === fillerRid && player.getPlayedMs() === 0) {
             const phrase = nextFiller();
-            console.log(`${ts()} [${callId}] [FILLER-INJECTED] response_id=${rid} phrase="${phrase}"`);
+            console.log(`${ts()} [${callId}] [FILLER-INJECTED] response_id=${fillerRid} phrase="${phrase}"`);
             xaiWs.send(JSON.stringify({
               type: "conversation.item.create",
               item: { type: "force_message", role: "assistant", interruptible: true, content: [{ type: "output_text", text: phrase }] },
             }));
+            // Do NOT re-arm filler timer after this — force_message creates its own response.created
           }
         }, FILLER_THRESHOLD_MS);
         break;
