@@ -438,10 +438,10 @@ app.ws("/media-stream/:callId", async (ws: any, req) => {
         const rid = player.getActiveResponseId();
         const queuedFrames = player.getQueuedFrameCount();
         console.log(`${ts()} [${callId}] [PACING] generation done, ${queuedFrames} frames (${queuedFrames * 20}ms) still queued for real-time playback`);
-        // markGenerationDone defers cleanup until paced queue drains
-        // so activeResponseId stays non-null until caller finishes hearing audio
         player.markGenerationDone(() => {
-          if (rid && !player.hadOutputItem()) {
+          // Only flag as false-start for message responses, not tool calls
+          // (tool call responses legitimately have no audio output)
+          if (rid && !player.hadOutputItem() && msg.type !== "response.cancelled") {
             console.log(`${ts()} [${callId}] [FALSE-START] response_id=${rid} ended with no output`);
           }
           console.log(`${ts()} [${callId}] [PACING] playback complete response_id=${rid}`);
@@ -527,10 +527,16 @@ app.ws("/media-stream/:callId", async (ws: any, req) => {
           (async () => {
             let args: Record<string, any> = {};
             try { args = JSON.parse(msg.item.arguments || "{}"); } catch {}
+            console.log(`${ts()} [${callId}] fn: ${msg.item.name}(${JSON.stringify(args)})`);
             const result = await handleToolCall(msg.item.name, args);
-            xaiWs.send(JSON.stringify({ type: "conversation.item.create", item: { type: "function_call_output", call_id: msg.item.call_id, output: result } }));
-            const waitForPlayback = () => new Promise<void>(res => { const check = () => { if (!player.getActiveResponseId()) { res(); return; } setTimeout(check, 50); }; check(); });
-            await waitForPlayback();
+            console.log(`${ts()} [${callId}] fn result: ${result}`);
+            xaiWs.send(JSON.stringify({
+              type: "conversation.item.create",
+              item: { type: "function_call_output", call_id: msg.item.call_id, output: result },
+            }));
+            // Send response.create immediately — no audio to wait for on tool-call turns.
+            // waitForPlayback caused a 7s hang because tool responses have no audio,
+            // so activeResponseId was null immediately, but response.done hadn't fired yet.
             xaiWs.send(JSON.stringify({ type: "response.create" }));
           })();
         }
