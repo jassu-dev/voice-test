@@ -347,7 +347,8 @@ app.ws("/media-stream/:callId", async (ws: any, req) => {
         const transcript = msg.transcript || "";
         const turnDuration = speechStartedAt > 0 ? Date.now() - speechStartedAt : 0;
         console.log(`${ts()} [${callId}] [TRANSCRIPTION] "${transcript}" turn_duration=${turnDuration}ms`);
-        if (callUserId) logTranscript(callId, callUserId, "user", transcript);
+        // Pass item_id to deduplicate — completed can fire multiple times as corrections
+        if (callUserId) logTranscript(callId, callUserId, "user", transcript, msg.item_id);
         if (turnDuration > 0 && transcript.length > 0 && (turnDuration / transcript.length) > 150)
           console.log(`${ts()} [${callId}] [LONG-TURN] ${turnDuration}ms — possible VAD noise`);
         break;
