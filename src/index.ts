@@ -37,14 +37,24 @@ function ts(): string { return new Date().toISOString().slice(11, 23); }
 
 
 // ── Pre-warm xAI WebSocket pool ───────────────────────────────────────────
-interface WarmConnection { ws: any; ready: boolean; createdAt: number; }
+interface WarmConnection { ws: any; ready: boolean; createdAt: number; earlyMessages: string[]; }
 let warmPool: WarmConnection | null = null;
 const MAX_WARM_AGE_MS = 55000;
 
 function createWarmConnection(): WarmConnection {
   const WebSocket = require("ws");
-  const conn: WarmConnection = { ws: new WebSocket(API_URL, { headers: { Authorization: `Bearer ${XAI_API_KEY}` } }), ready: false, createdAt: Date.now() };
+  const conn: WarmConnection = {
+    ws: new WebSocket(API_URL, { headers: { Authorization: `Bearer ${XAI_API_KEY}` } }),
+    ready: false,
+    createdAt: Date.now(),
+    earlyMessages: [],
+  };
   conn.ws.on("open", () => { conn.ready = true; });
+  // Buffer any server messages that arrive while connection sits idle in pool
+  // (session.created, conversation.created fire immediately on open)
+  conn.ws.on("message", (data: Buffer, isBinary: boolean) => {
+    if (!isBinary) conn.earlyMessages.push(data.toString());
+  });
   conn.ws.on("error", () => { if (warmPool === conn) warmPool = null; });
   conn.ws.on("close", () => { if (warmPool === conn) warmPool = null; });
   return conn;
@@ -54,10 +64,14 @@ function getOrCreateWarmWs(): Promise<any> {
   const WebSocket = require("ws");
   const now = Date.now();
   if (warmPool && warmPool.ready && (now - warmPool.createdAt) < MAX_WARM_AGE_MS) {
-    const ws = warmPool.ws;
+    const conn = warmPool;
     warmPool = null;
     setTimeout(() => { warmPool = createWarmConnection(); }, 0);
-    return Promise.resolve(ws);
+    if (conn.earlyMessages.length > 0) {
+      const types = conn.earlyMessages.map(m => { try { return JSON.parse(m).type; } catch { return "?"; } }).join(", ");
+      console.log(`${ts()} [pool] claimed warm connection had ${conn.earlyMessages.length} early message(s): ${types}`);
+    }
+    return Promise.resolve(conn.ws);
   }
   console.log(`${ts()} [pool] no warm connection — connecting now`);
   return new Promise((resolve, reject) => {
@@ -206,14 +220,13 @@ app.ws("/media-stream/:callId", async (ws: any, req) => {
       xaiWs.send(JSON.stringify({ type: "input_audio_buffer.append", audio: msg.media.payload }));
     } else if (msg.event === "stop") {
       console.log(`${ts()} [${callId}] call ended`);
-      clearWatchdog(); clearFillerTimer();
+      clearWatchdog(); clearFillerTimer(); clearTimeout(sessionReadyWatchdog);
       xaiWs.close();
     }
   });
 
-  ws.on("close", () => { clearWatchdog(); clearFillerTimer(); try { xaiWs.close(); } catch {} });
+  ws.on("close", () => { clearWatchdog(); clearFillerTimer(); clearTimeout(sessionReadyWatchdog); try { xaiWs.close(); } catch {} });
 
-  // ── Connect xAI ──────────────────────────────────────────────────────────
   console.log(`${ts()} [${callId}] [CONNECT-ATTEMPT-START]`);
   const connectStart = Date.now();
   const xaiWs = await getOrCreateWarmWs().catch(e => {
@@ -221,6 +234,33 @@ app.ws("/media-stream/:callId", async (ws: any, req) => {
     ws.close(); throw e;
   });
   console.log(`${ts()} [${callId}] xAI connected (+${Date.now() - connectStart}ms from attempt, +${Date.now() - callStartTime}ms total)`);
+
+  // ── FIX: Send session.update immediately — do NOT wait for conversation.created
+  // session.created and conversation.created fire immediately on socket open and
+  // may already be missed if this is a warm (pre-opened) connection.
+  // The socket is guaranteed open here (promise resolved on open event), so send now.
+  console.log(`${ts()} [${callId}] [SEND] session.update dispatched`);
+  xaiWs.send(JSON.stringify({
+    type: "session.update",
+    session: {
+      instructions: bot.instructions,
+      voice: "celeste",
+      reasoning: { effort: "none" },
+      turn_detection: { type: "server_vad", ...VAD_CONFIG },
+      audio: {
+        input: { format: { type: "audio/pcmu" }, transcription: { model: "grok-transcribe" } },
+        output: { format: { type: "audio/pcmu" } },
+      },
+      ...(ENABLE_TOOLS ? { tools } : {}),
+    },
+  }));
+
+  // ── Session-ready watchdog — fires if session never becomes ready ────────
+  const sessionReadyWatchdog = setTimeout(() => {
+    if (!sessionReady) {
+      console.log(`${ts()} [${callId}] [CRITICAL] session never became ready — call is deaf/mute`);
+    }
+  }, 3000);
 
 
   // ── xAI message handler ───────────────────────────────────────────────────
@@ -365,27 +405,15 @@ app.ws("/media-stream/:callId", async (ws: any, req) => {
 
       case "session.updated":
         sessionReady = true;
+        clearTimeout(sessionReadyWatchdog);
         console.log(`${ts()} [${callId}] session ready (+${Date.now() - callStartTime}ms total)`);
         xaiWs.send(JSON.stringify({ type: "conversation.item.create", item: { type: "force_message", role: "assistant", interruptible: true, content: [{ type: "output_text", text: "Hey! How can I help you today?" }] } }));
         console.log(`${ts()} [${callId}] [SEND] force_message greeting dispatched`);
         break;
 
+      // conversation.created: log only — session.update already sent above
       case "conversation.created":
-        console.log(`${ts()} [${callId}] [SEND] session.update dispatched`);
-        xaiWs.send(JSON.stringify({
-          type: "session.update",
-          session: {
-            instructions: bot.instructions,
-            voice: "celeste",
-            reasoning: { effort: "none" },
-            turn_detection: { type: "server_vad", ...VAD_CONFIG },
-            audio: {
-              input: { format: { type: "audio/pcmu" }, transcription: { model: "grok-transcribe" } },
-              output: { format: { type: "audio/pcmu" } },
-            },
-            ...(ENABLE_TOOLS ? { tools } : {}),
-          },
-        }));
+        console.log(`${ts()} [${callId}] conversation.created (session.update already dispatched)`);
         break;
 
       case "response.output_item.done":
