@@ -3,6 +3,7 @@ import express from "express";
 import ExpressWs from "express-ws";
 import * as crypto from "crypto";
 import bot from "./bot";
+import { notifyCallStart, notifyCallEnd, logTranscript } from "./db-client";
 
 const { app } = ExpressWs(express());
 app.use(express.urlencoded({ extended: true })).use(express.json());
@@ -11,49 +12,25 @@ const XAI_API_KEY = process.env.XAI_API_KEY || "";
 const API_URL = process.env.API_URL || "wss://api.x.ai/v1/realtime";
 const ENABLE_TOOLS = process.env.ENABLE_TOOLS !== "false";
 
-// ── Tunable config — all via env vars, no code changes needed ────────────
 const VAD_CONFIG = {
   threshold: parseFloat(process.env.VAD_THRESHOLD || "0.75"),
-  // 650ms: slightly snappier than 800ms, still handles natural mid-sentence pauses
-  // Try 700ms if callers get cut off; try 600ms if turns still feel slow
   silence_duration_ms: parseInt(process.env.VAD_SILENCE_MS || "650"),
   prefix_padding_ms: parseInt(process.env.VAD_PREFIX_MS || "400"),
 };
-
 const CANCEL_DEBOUNCE_MS = parseInt(process.env.CANCEL_DEBOUNCE_MS || "250");
-
-// Filler: 800ms — only fires on genuinely slow turns; 550ms was too aggressive
 const FILLER_THRESHOLD_MS = parseInt(process.env.FILLER_THRESHOLD_MS || "800");
 const FILLER_PHRASES = ["Mm-hmm,", "Let me see,", "Sure,"];
-
-// Voice: test rigel, naksh, lumen, celeste on real 8kHz phone lines
-// Some voices are crisper at narrowband — subjective, test with real callers
 const VOICE_ID = process.env.VOICE_ID || "rigel";
-
-// Output speed: 1.0 = normal, 1.05-1.1 = slightly snappier, >1.15 sounds artificial
 const OUTPUT_SPEED = parseFloat(process.env.OUTPUT_SPEED || "1.0");
+const REPLACE_MAP: Record<string, string> = {};
+const KEYTERMS: string[] = process.env.KEYTERMS ? process.env.KEYTERMS.split(",").map(k => k.trim()) : [];
 
-// Pronunciation replacements — add business-specific terms that get mispronounced
-// Key = text in transcript, Value = how it should sound when spoken
-const REPLACE_MAP: Record<string, string> = {
-  // "YourBrand": "Your Brand",  // example — add real terms here
-};
-
-// Keyterms for transcription accuracy — business/domain vocabulary
-// grok-transcribe uses these to bias ASR toward recognising specific words
-const KEYTERMS: string[] = process.env.KEYTERMS
-  ? process.env.KEYTERMS.split(",").map(k => k.trim())
-  : [];
 let fillerIndex = 0;
 const nextFiller = () => { const f = FILLER_PHRASES[fillerIndex % FILLER_PHRASES.length]; fillerIndex++; return f; };
+function generateSecureId(p: string) { return `${p}_${crypto.randomBytes(8).toString("hex")}`; }
+function ts() { return new Date().toISOString().slice(11, 23); }
 
-function generateSecureId(prefix: string): string {
-  return `${prefix}_${crypto.randomBytes(8).toString("hex")}`;
-}
-function ts(): string { return new Date().toISOString().slice(11, 23); }
-
-
-// ── Pre-warm xAI WebSocket pool ───────────────────────────────────────────
+// ── Warm pool ─────────────────────────────────────────────────────────────
 interface WarmConnection { ws: any; ready: boolean; createdAt: number; earlyMessages: string[]; }
 let warmPool: WarmConnection | null = null;
 const MAX_WARM_AGE_MS = 55000;
@@ -62,16 +39,10 @@ function createWarmConnection(): WarmConnection {
   const WebSocket = require("ws");
   const conn: WarmConnection = {
     ws: new WebSocket(API_URL, { headers: { Authorization: `Bearer ${XAI_API_KEY}` } }),
-    ready: false,
-    createdAt: Date.now(),
-    earlyMessages: [],
+    ready: false, createdAt: Date.now(), earlyMessages: [],
   };
   conn.ws.on("open", () => { conn.ready = true; });
-  // Buffer any server messages that arrive while connection sits idle in pool
-  // (session.created, conversation.created fire immediately on open)
-  conn.ws.on("message", (data: Buffer, isBinary: boolean) => {
-    if (!isBinary) conn.earlyMessages.push(data.toString());
-  });
+  conn.ws.on("message", (data: Buffer, isBinary: boolean) => { if (!isBinary) conn.earlyMessages.push(data.toString()); });
   conn.ws.on("error", () => { if (warmPool === conn) warmPool = null; });
   conn.ws.on("close", () => { if (warmPool === conn) warmPool = null; });
   return conn;
@@ -81,12 +52,11 @@ function getOrCreateWarmWs(): Promise<any> {
   const WebSocket = require("ws");
   const now = Date.now();
   if (warmPool && warmPool.ready && (now - warmPool.createdAt) < MAX_WARM_AGE_MS) {
-    const conn = warmPool;
-    warmPool = null;
+    const conn = warmPool; warmPool = null;
     setTimeout(() => { warmPool = createWarmConnection(); }, 0);
     if (conn.earlyMessages.length > 0) {
       const types = conn.earlyMessages.map(m => { try { return JSON.parse(m).type; } catch { return "?"; } }).join(", ");
-      console.log(`${ts()} [pool] claimed warm connection had ${conn.earlyMessages.length} early message(s): ${types}`);
+      console.log(`${ts()} [pool] warm connection had ${conn.earlyMessages.length} early messages: ${types}`);
     }
     return Promise.resolve(conn.ws);
   }
@@ -102,7 +72,7 @@ warmPool = createWarmConnection();
 
 const tools = [
   { type: "function", name: "generate_random_number", description: "Generate a random number between min and max values",
-    parameters: { type: "object", properties: { min: { type: "number", description: "Minimum value (inclusive)" }, max: { type: "number", description: "Maximum value (inclusive)" } }, required: ["min", "max"] } },
+    parameters: { type: "object", properties: { min: { type: "number" }, max: { type: "number" } }, required: ["min", "max"] } },
 ];
 
 async function handleToolCall(name: string, args: Record<string, any>): Promise<string> {
@@ -113,128 +83,85 @@ async function handleToolCall(name: string, args: Record<string, any>): Promise<
   return JSON.stringify({ error: `Unknown tool: ${name}` });
 }
 
-
-// ── Audio Playback Manager (wall-clock paced state tracking) ─────────────
-// Audio is sent to Twilio immediately as deltas arrive (no setInterval jitter).
-// We track playback state via wall clock so activeResponseId stays non-null
-// for the real duration of audible playback, enabling correct barge-in detection.
-// mulaw 8kHz: 8000 bytes/sec = 8 bytes/ms
+// ── AudioPlayer ───────────────────────────────────────────────────────────
 class AudioPlayer {
   private activeResponseId: string | null = null;
-  private totalQueuedBytes: number = 0;    // total bytes enqueued this response
-  private playbackStartedAt: number = 0;   // wall clock when first frame sent
-  private outputItemAdded: boolean = false;
-  private generationDoneAt: number = 0;    // when response.done arrived
+  private totalQueuedBytes = 0;
+  private playbackStartedAt = 0;
+  private outputItemAdded = false;
   private onDrained: (() => void) | null = null;
   private drainTimer: ReturnType<typeof setTimeout> | null = null;
-  private sendFn: (payload: string) => void;
+  private firstChunkLogged = false;
   private callId: string;
-  private firstChunkLogged: boolean = false;
+  private sendFn: (p: string) => void;
 
-  constructor(callId: string, sendFn: (payload: string) => void) {
-    this.callId = callId;
-    this.sendFn = sendFn;
+  constructor(callId: string, sendFn: (p: string) => void) { this.callId = callId; this.sendFn = sendFn; }
+
+  setResponse(id: string) {
+    this.stopDrain(); this.activeResponseId = id; this.totalQueuedBytes = 0;
+    this.playbackStartedAt = 0; this.outputItemAdded = false; this.onDrained = null; this.firstChunkLogged = false;
   }
-
-  setResponse(responseId: string) {
-    this.stopDrainTimer();
-    this.activeResponseId = responseId;
-    this.totalQueuedBytes = 0;
-    this.playbackStartedAt = 0;
-    this.outputItemAdded = false;
-    this.generationDoneAt = 0;
-    this.onDrained = null;
-    this.firstChunkLogged = false;
-  }
-
   markOutputItem() { this.outputItemAdded = true; }
   hadOutputItem() { return this.outputItemAdded; }
   getQueuedFrameCount() { return Math.ceil(this.totalQueuedBytes / 160); }
 
-  // Send immediately — no pacing timer, no jitter
-  enqueue(base64Payload: string, responseId: string) {
+  enqueue(b64: string, responseId: string) {
     if (responseId !== this.activeResponseId) return;
-    const bytes = Buffer.from(base64Payload, "base64");
+    const bytes = Buffer.from(b64, "base64");
     if (this.playbackStartedAt === 0) {
       this.playbackStartedAt = Date.now();
-      if (!this.firstChunkLogged) {
-        console.log(`${ts()} [${this.callId}] [LATENCY] first audio chunk → Twilio`);
-        this.firstChunkLogged = true;
-      }
+      if (!this.firstChunkLogged) { console.log(`${ts()} [${this.callId}] [LATENCY] first audio chunk → Twilio`); this.firstChunkLogged = true; }
     }
     this.totalQueuedBytes += bytes.length;
-    this.sendFn(base64Payload); // send immediately — Twilio buffers and plays at correct rate
+    this.sendFn(b64);
   }
 
-  // Returns estimated ms actually played so far (wall clock based)
-  getPlayedMs(): number {
+  getPlayedMs() {
     if (this.playbackStartedAt === 0) return 0;
-    const elapsed = Date.now() - this.playbackStartedAt;
-    const totalPlaybackMs = Math.round(this.totalQueuedBytes / 8); // 8 bytes/ms at 8kHz
-    return Math.min(elapsed, totalPlaybackMs); // can't have played more than total
+    return Math.min(Date.now() - this.playbackStartedAt, Math.round(this.totalQueuedBytes / 8));
   }
 
-  getActiveResponseId(): string | null { return this.activeResponseId; }
+  getActiveResponseId() { return this.activeResponseId; }
 
-  // Called on response.done — schedule cleanup after actual playback duration
-  markGenerationDone(onActuallyDone: () => void) {
-    this.generationDoneAt = Date.now();
-    const totalPlaybackMs = Math.round(this.totalQueuedBytes / 8);
-    const alreadyElapsed = this.playbackStartedAt > 0 ? Date.now() - this.playbackStartedAt : 0;
-    const remainingMs = Math.max(0, totalPlaybackMs - alreadyElapsed);
-    console.log(`${ts()} [${this.callId}] [PACING] generation done, ~${Math.round(remainingMs)}ms of audio still playing`);
-    if (remainingMs <= 0) {
-      onActuallyDone();
-    } else {
-      this.onDrained = onActuallyDone;
-      this.drainTimer = setTimeout(() => {
-        this.drainTimer = null;
-        this.onDrained = null;
-        onActuallyDone();
-      }, remainingMs + 100); // +100ms buffer for network jitter
-    }
+  markGenerationDone(cb: () => void) {
+    const totalMs = Math.round(this.totalQueuedBytes / 8);
+    const elapsed = this.playbackStartedAt > 0 ? Date.now() - this.playbackStartedAt : 0;
+    const remaining = Math.max(0, totalMs - elapsed);
+    console.log(`${ts()} [${this.callId}] [PACING] generation done, ~${remaining}ms audio still playing`);
+    if (remaining <= 0) { cb(); return; }
+    this.onDrained = cb;
+    this.drainTimer = setTimeout(() => { this.drainTimer = null; this.onDrained = null; cb(); }, remaining + 100);
   }
 
-  // Hard interrupt — stop tracking, cancel pending drain timer
-  interrupt(): number {
-    const played = this.getPlayedMs();
-    this.stopDrainTimer();
-    this.activeResponseId = null;
-    this.outputItemAdded = false;
-    this.onDrained = null;
+  interrupt() {
+    const played = this.getPlayedMs(); this.stopDrain(); this.activeResponseId = null; this.outputItemAdded = false; this.onDrained = null;
     return played;
   }
 
   clear() {
-    this.stopDrainTimer();
-    this.activeResponseId = null;
-    this.totalQueuedBytes = 0;
-    this.playbackStartedAt = 0;
-    this.outputItemAdded = false;
-    this.generationDoneAt = 0;
-    this.onDrained = null;
-    this.firstChunkLogged = false;
+    this.stopDrain(); this.activeResponseId = null; this.totalQueuedBytes = 0; this.playbackStartedAt = 0;
+    this.outputItemAdded = false; this.onDrained = null; this.firstChunkLogged = false;
   }
 
-  private stopDrainTimer() {
-    if (this.drainTimer) { clearTimeout(this.drainTimer); this.drainTimer = null; }
-  }
+  private stopDrain() { if (this.drainTimer) { clearTimeout(this.drainTimer); this.drainTimer = null; } }
 }
 
-app.get("/health", (_req, res) => res.json({ status: "ok", vad: VAD_CONFIG, cancelDebounce: CANCEL_DEBOUNCE_MS, fillerThreshold: FILLER_THRESHOLD_MS }));
+// ── Routes ────────────────────────────────────────────────────────────────
+app.get("/health", (_req, res) => res.json({ status: "ok", vad: VAD_CONFIG }));
 
 app.post("/twiml", (_req, res) => {
   if (!process.env.HOSTNAME) { res.status(500).send("HOSTNAME not set"); return; }
   const callId = generateSecureId("call");
   const hostname = process.env.HOSTNAME.replace(/^https?:\/\//, "").replace(/\/$/, "");
-  console.log(`${ts()} [${callId}] incoming call`);
+  const callerNumber = _req.body?.From || "";
+  const phoneNumberDialed = _req.body?.To || "";
+  console.log(`${ts()} [${callId}] incoming call to=${phoneNumberDialed} from=${callerNumber}`);
   res.status(200).type("text/xml").end(
     `<Response><Connect><Stream url="wss://${hostname}/media-stream/${callId}" /></Connect></Response>`
   );
 });
 
 app.post("/call-status", (_req, res) => res.status(200).send());
-
 
 // ── Inbound Media Stream ───────────────────────────────────────────────────
 app.ws("/media-stream/:callId", async (ws: any, req) => {
@@ -247,25 +174,21 @@ app.ws("/media-stream/:callId", async (ws: any, req) => {
   let currentItemId: string | null = null;
   const pendingAudio: string[] = [];
   let micChunkCount = 0;
-
-  // Barge-in state
   let lastCancelSentAt = 0;
   let lastCancelledResponseId: string | null = null;
   let lastCancelTimestamp = 0;
-
-  // Turn timing (Issue 1 Fix B)
   let speechStartedAt = 0;
-  let lastTranscript = "";
+  let currentAssistantTranscript = "";
+  let callUserId = "";
+  let callInstructions = bot.instructions;
 
-  // Watchdog
   let commitWatchdog: ReturnType<typeof setTimeout> | null = null;
   const clearWatchdog = () => { if (commitWatchdog) { clearTimeout(commitWatchdog); commitWatchdog = null; } };
   const startWatchdog = () => {
     clearWatchdog();
-    commitWatchdog = setTimeout(() => { console.log(`${ts()} [${callId}] [WATCHDOG] no response.created within 2500ms of commit`); }, 2500);
+    commitWatchdog = setTimeout(() => { console.log(`${ts()} [${callId}] [WATCHDOG] no response.created within 2500ms`); }, 2500);
   };
 
-  // Filler injection (Issue 3 Fix B)
   let fillerTimer: ReturnType<typeof setTimeout> | null = null;
   const clearFillerTimer = () => { if (fillerTimer) { clearTimeout(fillerTimer); fillerTimer = null; } };
 
@@ -281,14 +204,21 @@ app.ws("/media-stream/:callId", async (ws: any, req) => {
 
   const player = new AudioPlayer(callId, sendToTwilio);
 
-  // ── Twilio handler first ─────────────────────────────────────────────────
+  // Register Twilio handler FIRST — before any await
   ws.on("message", (raw: string) => {
     let msg: any;
     try { msg = JSON.parse(raw.toString()); } catch { return; }
 
     if (msg.event === "start") {
       streamSid = msg.start.streamSid;
+      // Twilio sends To/From in the webhook body which we stored; also try callSid metadata
+      const phoneNumberDialed = msg.start.customParameters?.To || "";
+      const callerNumber = msg.start.customParameters?.From || "";
       console.log(`${ts()} [${callId}] twilio ready sid=${streamSid} (+${Date.now() - callStartTime}ms)`);
+      // Per-account lookup (async, non-blocking — falls back to default if fails)
+      notifyCallStart(callId, phoneNumberDialed, callerNumber).then(data => {
+        if (data) { callUserId = data.user_id || ""; callInstructions = data.instructions || bot.instructions; }
+      }).catch(() => {});
       if (pendingAudio.length > 0) {
         for (const p of pendingAudio) ws.send(JSON.stringify({ event: "media", streamSid, media: { payload: p } }));
         pendingAudio.length = 0;
@@ -302,39 +232,41 @@ app.ws("/media-stream/:callId", async (ws: any, req) => {
     } else if (msg.event === "stop") {
       console.log(`${ts()} [${callId}] call ended`);
       clearWatchdog(); clearFillerTimer(); clearTimeout(sessionReadyWatchdog);
+      notifyCallEnd(callId, Math.round((Date.now() - callStartTime) / 1000));
       xaiWs.close();
     }
   });
 
-  ws.on("close", () => { clearWatchdog(); clearFillerTimer(); clearTimeout(sessionReadyWatchdog); player.clear(); try { xaiWs.close(); } catch {} });
+  ws.on("close", () => {
+    clearWatchdog(); clearFillerTimer(); clearTimeout(sessionReadyWatchdog); player.clear();
+    try { xaiWs.close(); } catch {}
+  });
 
+  // Connect xAI
   console.log(`${ts()} [${callId}] [CONNECT-ATTEMPT-START]`);
   const connectStart = Date.now();
-  const xaiWs = await getOrCreateWarmWs().catch(e => {
-    console.log(`${ts()} [${callId}] xAI connect failed: ${e.message}`);
-    ws.close(); throw e;
-  });
-  console.log(`${ts()} [${callId}] xAI connected (+${Date.now() - connectStart}ms from attempt, +${Date.now() - callStartTime}ms total)`);
+  let xaiWs: any;
+  try {
+    xaiWs = await getOrCreateWarmWs();
+  } catch (e: any) {
+    console.error(`${ts()} [${callId}] xAI connect failed: ${e.message}`);
+    ws.close(); return;
+  }
+  console.log(`${ts()} [${callId}] xAI connected (+${Date.now() - connectStart}ms, +${Date.now() - callStartTime}ms total)`);
 
-  // ── FIX: Send session.update immediately — do NOT wait for conversation.created
-  // session.created and conversation.created fire immediately on socket open and
-  // may already be missed if this is a warm (pre-opened) connection.
-  // The socket is guaranteed open here (promise resolved on open event), so send now.
+  // Send session.update immediately — warm connections may have missed conversation.created
   console.log(`${ts()} [${callId}] [SEND] session.update dispatched`);
   xaiWs.send(JSON.stringify({
     type: "session.update",
     session: {
-      instructions: bot.instructions,
+      instructions: callInstructions,
       voice: VOICE_ID,
       reasoning: { effort: "none" },
       turn_detection: { type: "server_vad", ...VAD_CONFIG },
       audio: {
         input: {
           format: { type: "audio/pcmu" },
-          transcription: {
-            model: "grok-transcribe",
-            ...(KEYTERMS.length > 0 ? { keyterms: KEYTERMS } : {}),
-          },
+          transcription: { model: "grok-transcribe", ...(KEYTERMS.length > 0 ? { keyterms: KEYTERMS } : {}) },
         },
         output: {
           format: { type: "audio/pcmu" },
@@ -346,24 +278,12 @@ app.ws("/media-stream/:callId", async (ws: any, req) => {
     },
   }));
 
-  // ── Session-ready watchdog — fires if session never becomes ready ────────
   const sessionReadyWatchdog = setTimeout(() => {
-    if (!sessionReady) {
-      console.log(`${ts()} [${callId}] [CRITICAL] session never became ready — call is deaf/mute`);
-    }
+    if (!sessionReady) console.log(`${ts()} [${callId}] [CRITICAL] session never became ready`);
   }, 3000);
 
-
-  // ── xAI message handler ───────────────────────────────────────────────────
   xaiWs.on("message", (data: Buffer, isBinary: boolean) => {
-    if (isBinary) {
-      const payload = data.toString("base64");
-      const rid = player.getActiveResponseId() || "";
-      clearFillerTimer();
-      player.enqueue(payload, rid);
-      return;
-    }
-
+    if (isBinary) { clearFillerTimer(); player.enqueue(data.toString("base64"), player.getActiveResponseId() || ""); return; }
     let msg: any;
     try { msg = JSON.parse(data.toString()); } catch { return; }
 
@@ -371,157 +291,109 @@ app.ws("/media-stream/:callId", async (ws: any, req) => {
     if (!quiet.includes(msg.type)) console.log(`${ts()} [${callId}] ${msg.type}`);
 
     switch (msg.type) {
-
-      // ── Issue 2 Fix B: downgrade known-race error, log others fully ──────
       case "error": {
-        const errMsg: string = msg.error?.message || "";
-        if (errMsg.includes("Cancellation failed")) {
-          console.log(`${ts()} [${callId}] [EXPECTED-RACE] ${errMsg}`);
-        } else {
-          console.log(`${ts()} [${callId}] [SERVER-ERROR] ${JSON.stringify(msg)}`);
-        }
+        const em: string = msg.error?.message || "";
+        if (em.includes("Cancellation failed")) console.log(`${ts()} [${callId}] [EXPECTED-RACE] ${em}`);
+        else console.log(`${ts()} [${callId}] [SERVER-ERROR] ${JSON.stringify(msg)}`);
         break;
       }
-
       case "response.output_audio.delta":
-        if (msg.delta && msg.response_id) {
-          clearFillerTimer();
-          player.enqueue(msg.delta, msg.response_id);
-        }
+        if (msg.delta && msg.response_id) { clearFillerTimer(); player.enqueue(msg.delta, msg.response_id); }
         break;
-
       case "response.output_audio_transcript.delta":
         process.stdout.write(msg.delta || "");
+        currentAssistantTranscript += (msg.delta || "");
         break;
-
       case "response.created": {
         clearWatchdog();
         const rid = msg.response?.id || "";
         const now = Date.now();
-        if (lastCancelledResponseId && (now - lastCancelTimestamp) < 400) {
-          console.log(`${ts()} [${callId}] [FALSE-START] response_id=${rid} created ${now - lastCancelTimestamp}ms after cancel of ${lastCancelledResponseId}`);
-        }
+        if (lastCancelledResponseId && (now - lastCancelTimestamp) < 400)
+          console.log(`${ts()} [${callId}] [FALSE-START] response_id=${rid} created ${now - lastCancelTimestamp}ms after cancel`);
         console.log(`${ts()} [${callId}] [LATENCY] response.created id=${rid} (+${Date.now() - callStartTime}ms total)`);
         player.setResponse(rid);
-
-        // Issue 3 Fix B: filler injection if no audio within FILLER_THRESHOLD_MS
-        // Only arm for real LLM responses — guard against re-arming on force_message turns
         clearFillerTimer();
         const fillerRid = rid;
         fillerTimer = setTimeout(() => {
           fillerTimer = null;
-          // Only inject if this is still the active response AND no audio has played yet
           if (player.getActiveResponseId() === fillerRid && player.getPlayedMs() === 0) {
             const phrase = nextFiller();
-            console.log(`${ts()} [${callId}] [FILLER-INJECTED] response_id=${fillerRid} phrase="${phrase}"`);
-            xaiWs.send(JSON.stringify({
-              type: "conversation.item.create",
-              item: { type: "force_message", role: "assistant", interruptible: true, content: [{ type: "output_text", text: phrase }] },
-            }));
-            // Do NOT re-arm filler timer after this — force_message creates its own response.created
+            console.log(`${ts()} [${callId}] [FILLER-INJECTED] phrase="${phrase}"`);
+            xaiWs.send(JSON.stringify({ type: "conversation.item.create", item: { type: "force_message", role: "assistant", interruptible: true, content: [{ type: "output_text", text: phrase }] } }));
           }
         }, FILLER_THRESHOLD_MS);
         break;
       }
-
       case "response.output_item.added":
-        if (msg.item?.type === "message" && msg.item?.role === "assistant") {
-          currentItemId = msg.item.id;
-          player.markOutputItem();
-        }
+        if (msg.item?.type === "message" && msg.item?.role === "assistant") { currentItemId = msg.item.id; player.markOutputItem(); }
         break;
-
       case "response.done":
       case "response.cancelled": {
-        process.stdout.write("\n");
-        clearFillerTimer();
+        process.stdout.write("\n"); clearFillerTimer();
+        if (currentAssistantTranscript && callUserId) logTranscript(callId, callUserId, "assistant", currentAssistantTranscript);
+        currentAssistantTranscript = "";
         const rid = player.getActiveResponseId();
-        const queuedFrames = player.getQueuedFrameCount();
-        console.log(`${ts()} [${callId}] [PACING] generation done, ${queuedFrames} frames (${queuedFrames * 20}ms) still queued for real-time playback`);
+        const qf = player.getQueuedFrameCount();
+        console.log(`${ts()} [${callId}] [PACING] generation done, ~${qf * 20}ms audio still playing`);
         player.markGenerationDone(() => {
-          // Only flag as false-start for message responses, not tool calls
-          // (tool call responses legitimately have no audio output)
-          if (rid && !player.hadOutputItem() && msg.type !== "response.cancelled") {
-            console.log(`${ts()} [${callId}] [FALSE-START] response_id=${rid} ended with no output`);
-          }
+          if (rid && !player.hadOutputItem() && msg.type !== "response.cancelled")
+            console.log(`${ts()} [${callId}] [FALSE-START] response_id=${rid} no output`);
           console.log(`${ts()} [${callId}] [PACING] playback complete response_id=${rid}`);
         });
         break;
       }
-
       case "conversation.item.input_audio_transcription.completed": {
-        lastTranscript = msg.transcript || "";
+        const transcript = msg.transcript || "";
         const turnDuration = speechStartedAt > 0 ? Date.now() - speechStartedAt : 0;
-        console.log(`${ts()} [${callId}] [TRANSCRIPTION] "${lastTranscript}" turn_duration=${turnDuration}ms transcript_len=${lastTranscript.length}`);
-        // Issue 1 Fix B: flag suspiciously long turns
-        if (turnDuration > 0 && lastTranscript.length > 0) {
-          const msPerChar = turnDuration / lastTranscript.length;
-          if (msPerChar > 150) { // >150ms per char = far longer than actual speech
-            console.log(`${ts()} [${callId}] [LONG-TURN] duration=${turnDuration}ms transcript_len=${lastTranscript.length} ms_per_char=${Math.round(msPerChar)} — possible VAD noise issue`);
-          }
-        }
+        console.log(`${ts()} [${callId}] [TRANSCRIPTION] "${transcript}" turn_duration=${turnDuration}ms`);
+        if (callUserId) logTranscript(callId, callUserId, "user", transcript);
+        if (turnDuration > 0 && transcript.length > 0 && (turnDuration / transcript.length) > 150)
+          console.log(`${ts()} [${callId}] [LONG-TURN] ${turnDuration}ms — possible VAD noise`);
         break;
       }
-
       case "conversation.item.input_audio_transcription.updated":
         console.log(`${ts()} [${callId}] [TRANSCRIPTION-UPDATE] "${msg.transcript}"`);
         break;
-
-      // ── Barge-in — guarded + debounced ───────────────────────────────────
       case "input_audio_buffer.speech_started": {
         speechStartedAt = Date.now();
         const activeRid = player.getActiveResponseId();
         if (activeRid !== null) {
           const playedMs = player.interrupt();
           if (streamSid) ws.send(JSON.stringify({ event: "clear", streamSid }));
-
           const now = Date.now();
-          // Issue 2 Fix A: debounce cancel sends — local state always updated
           if (now - lastCancelSentAt < CANCEL_DEBOUNCE_MS) {
-            console.log(`${ts()} [${callId}] [BARGE-IN-SUPPRESSED] within ${CANCEL_DEBOUNCE_MS}ms debounce, skipping cancel send (played=${playedMs}ms)`);
+            console.log(`${ts()} [${callId}] [BARGE-IN-SUPPRESSED] debounce played=${playedMs}ms`);
           } else {
-            lastCancelSentAt = now;
-            lastCancelledResponseId = activeRid;
-            lastCancelTimestamp = now;
+            lastCancelSentAt = now; lastCancelledResponseId = activeRid; lastCancelTimestamp = now;
             console.log(`${ts()} [${callId}] [BARGE-IN] cancelling response_id=${activeRid} played=${playedMs}ms`);
             xaiWs.send(JSON.stringify({ type: "response.cancel" }));
-            if (currentItemId && playedMs > 0) {
+            if (currentItemId && playedMs > 0)
               xaiWs.send(JSON.stringify({ type: "conversation.item.truncate", item_id: currentItemId, content_index: 0, audio_end_ms: playedMs }));
-            }
           }
         } else {
           console.log(`${ts()} [${callId}] [speech_started] no active response — normal turn`);
         }
         break;
       }
-
       case "input_audio_buffer.speech_stopped":
-        console.log(`${ts()} [${callId}] [LATENCY] speech_stopped (+${Date.now() - speechStartedAt}ms from speech_started)`);
+        console.log(`${ts()} [${callId}] [LATENCY] speech_stopped (+${Date.now() - speechStartedAt}ms)`);
         break;
-
       case "input_audio_buffer.committed":
         console.log(`${ts()} [${callId}] [LATENCY] committed — requesting response`);
-        startWatchdog();
-        xaiWs.send(JSON.stringify({ type: "response.create" }));
+        startWatchdog(); xaiWs.send(JSON.stringify({ type: "response.create" }));
         break;
-
       case "conversation.item.truncated":
         console.log(`${ts()} [${callId}] item truncated at ${msg.audio_end_ms}ms`);
         break;
-
       case "session.updated":
-        sessionReady = true;
-        clearTimeout(sessionReadyWatchdog);
+        sessionReady = true; clearTimeout(sessionReadyWatchdog);
         console.log(`${ts()} [${callId}] session ready (+${Date.now() - callStartTime}ms total)`);
         xaiWs.send(JSON.stringify({ type: "conversation.item.create", item: { type: "force_message", role: "assistant", interruptible: true, content: [{ type: "output_text", text: "Hey! How can I help you today?" }] } }));
         console.log(`${ts()} [${callId}] [SEND] force_message greeting dispatched`);
         break;
-
-      // conversation.created: log only — session.update already sent above
       case "conversation.created":
-        console.log(`${ts()} [${callId}] conversation.created (session.update already dispatched)`);
+        console.log(`${ts()} [${callId}] conversation.created`);
         break;
-
       case "response.output_item.done":
         if (msg.item?.type === "function_call") {
           (async () => {
@@ -529,14 +401,7 @@ app.ws("/media-stream/:callId", async (ws: any, req) => {
             try { args = JSON.parse(msg.item.arguments || "{}"); } catch {}
             console.log(`${ts()} [${callId}] fn: ${msg.item.name}(${JSON.stringify(args)})`);
             const result = await handleToolCall(msg.item.name, args);
-            console.log(`${ts()} [${callId}] fn result: ${result}`);
-            xaiWs.send(JSON.stringify({
-              type: "conversation.item.create",
-              item: { type: "function_call_output", call_id: msg.item.call_id, output: result },
-            }));
-            // Send response.create immediately — no audio to wait for on tool-call turns.
-            // waitForPlayback caused a 7s hang because tool responses have no audio,
-            // so activeResponseId was null immediately, but response.done hadn't fired yet.
+            xaiWs.send(JSON.stringify({ type: "conversation.item.create", item: { type: "function_call_output", call_id: msg.item.call_id, output: result } }));
             xaiWs.send(JSON.stringify({ type: "response.create" }));
           })();
         }
@@ -547,7 +412,6 @@ app.ws("/media-stream/:callId", async (ws: any, req) => {
   xaiWs.on("error", (e: any) => console.log(`${ts()} [${callId}] ws error: ${e?.message}`));
   xaiWs.on("close", (code: number) => { player.clear(); console.log(`${ts()} [${callId}] ws closed: ${code}`); });
 });
-
 
 // ── Outbound ───────────────────────────────────────────────────────────────
 const OUTBOUND_INSTRUCTIONS = `You are an outbound AI phone agent. YOU speak first. Greet warmly, keep replies short and conversational.`;
@@ -584,18 +448,16 @@ app.ws("/outbound-stream", (ws: any) => {
 
       xaiWs = new WebSocket(API_URL, { headers: { Authorization: `Bearer ${XAI_API_KEY}` } });
 
-      // Outbound wall-clock audio state (no setInterval — avoids jitter)
-      const BYTES_PER_MS = 8; // 8kHz mulaw
-      let outTotalBytes = 0;
-      let outPlaybackStartedAt = 0;
+      const BYTES_PER_MS = 8;
+      let outTotalBytes = 0, outPlaybackStartedAt = 0;
       let outDrainTimer: ReturnType<typeof setTimeout> | null = null;
 
-      const enqueueOutAudio = (base64Payload: string, responseId: string) => {
+      const enqueueOutAudio = (b64: string, responseId: string) => {
         if (responseId !== currentResponseId) return;
-        const bytes = Buffer.from(base64Payload, "base64");
+        const bytes = Buffer.from(b64, "base64");
         if (outPlaybackStartedAt === 0) outPlaybackStartedAt = Date.now();
         outTotalBytes += bytes.length;
-        if (streamSid) ws.send(JSON.stringify({ event: "media", streamSid, media: { payload: base64Payload } }));
+        if (streamSid) ws.send(JSON.stringify({ event: "media", streamSid, media: { payload: b64 } }));
         playedMs = Math.min(Date.now() - outPlaybackStartedAt, Math.round(outTotalBytes / BYTES_PER_MS));
       };
 
@@ -604,58 +466,49 @@ app.ws("/outbound-stream", (ws: any) => {
         outTotalBytes = 0; outPlaybackStartedAt = 0;
       };
 
-      const markOutGenerationDone = (onDone: () => void) => {
+      const markOutDone = (cb: () => void) => {
         const totalMs = Math.round(outTotalBytes / BYTES_PER_MS);
         const elapsed = outPlaybackStartedAt > 0 ? Date.now() - outPlaybackStartedAt : 0;
         const remaining = Math.max(0, totalMs - elapsed);
-        console.log(`${ts()} [OUTBOUND][${callSid}] [PACING] generation done, ~${remaining}ms of audio still playing`);
-        if (remaining <= 0) { onDone(); }
-        else { outDrainTimer = setTimeout(() => { outDrainTimer = null; onDone(); }, remaining + 100); }
+        console.log(`${ts()} [OUTBOUND][${callSid}] [PACING] ~${remaining}ms audio still playing`);
+        if (remaining <= 0) { cb(); return; }
+        outDrainTimer = setTimeout(() => { outDrainTimer = null; cb(); }, remaining + 100);
       };
+
       xaiWs.on("open", () => {
         console.log(`${ts()} [OUTBOUND][${callSid}] [SEND] session.update dispatched`);
-        xaiWs.send(JSON.stringify({ type: "session.update", session: {
-          instructions: OUTBOUND_INSTRUCTIONS, voice: VOICE_ID, reasoning: { effort: "none" },
-          turn_detection: { type: "server_vad", ...VAD_CONFIG },
-          audio: {
-            input: {
-              format: { type: "audio/pcmu" },
-              transcription: {
-                model: "grok-transcribe",
-                ...(KEYTERMS.length > 0 ? { keyterms: KEYTERMS } : {}),
-              },
-            },
-            output: {
-              format: { type: "audio/pcmu" },
-              ...(OUTPUT_SPEED !== 1.0 ? { speed: OUTPUT_SPEED } : {}),
+        xaiWs.send(JSON.stringify({
+          type: "session.update",
+          session: {
+            instructions: OUTBOUND_INSTRUCTIONS, voice: VOICE_ID, reasoning: { effort: "none" },
+            turn_detection: { type: "server_vad", ...VAD_CONFIG },
+            audio: {
+              input: { format: { type: "audio/pcmu" }, transcription: { model: "grok-transcribe" } },
+              output: { format: { type: "audio/pcmu" }, ...(OUTPUT_SPEED !== 1.0 ? { speed: OUTPUT_SPEED } : {}) },
             },
           },
-          ...(Object.keys(REPLACE_MAP).length > 0 ? { replace: REPLACE_MAP } : {}),
-        }}));
+        }));
       });
 
       xaiWs.on("message", (d: Buffer, isBinary: boolean) => {
-        if (isBinary) {
-          const payload = d.toString("base64");
-          if (streamSid && currentResponseId) enqueueOutAudio(payload, currentResponseId);
-          return;
-        }
+        if (isBinary) { if (streamSid && currentResponseId) enqueueOutAudio(d.toString("base64"), currentResponseId); return; }
         let m: any;
         try { m = JSON.parse(d.toString()); } catch { return; }
         if (m.type !== "response.output_audio.delta") console.log(`${ts()} [OUTBOUND][${callSid}] ${m.type}`);
 
         switch (m.type) {
           case "error": {
-            const errMsg: string = m.error?.message || "";
-            if (errMsg.includes("Cancellation failed")) { console.log(`${ts()} [OUTBOUND] [EXPECTED-RACE] ${errMsg}`); }
-            else { console.log(`${ts()} [OUTBOUND] [SERVER-ERROR] ${JSON.stringify(m)}`); }
+            const em: string = m.error?.message || "";
+            if (em.includes("Cancellation failed")) console.log(`${ts()} [OUTBOUND] [EXPECTED-RACE] ${em}`);
+            else console.log(`${ts()} [OUTBOUND] [SERVER-ERROR] ${JSON.stringify(m)}`);
             break;
           }
           case "session.updated": sessionReady = true; xaiWs.send(JSON.stringify({ type: "response.create" })); break;
           case "response.created": {
             if (commitWatchdog) { clearTimeout(commitWatchdog); commitWatchdog = null; }
             const now = Date.now();
-            if (lastCancelledResponseId && (now - lastCancelTimestamp) < 400) console.log(`${ts()} [OUTBOUND][${callSid}] [FALSE-START] response_id=${m.response?.id} created ${now - lastCancelTimestamp}ms after cancel`);
+            if (lastCancelledResponseId && (now - lastCancelTimestamp) < 400)
+              console.log(`${ts()} [OUTBOUND][${callSid}] [FALSE-START] response_id=${m.response?.id}`);
             turnCount++; currentResponseId = m.response?.id || null; playedMs = 0; outputItemAdded = false;
             break;
           }
@@ -663,14 +516,13 @@ app.ws("/outbound-stream", (ws: any) => {
             if (m.item?.type === "message" && m.item?.role === "assistant") { currentItemId = m.item.id; outputItemAdded = true; }
             break;
           case "response.output_audio.delta":
-            if (m.delta && m.response_id === currentResponseId && streamSid) {
-              enqueueOutAudio(m.delta, m.response_id);
-            }
+            if (m.delta && m.response_id === currentResponseId) enqueueOutAudio(m.delta, m.response_id);
             break;
-          case "response.done": case "response.cancelled": {
+          case "response.done":
+          case "response.cancelled": {
             const doneRid = currentResponseId;
-            markOutGenerationDone(() => {
-              if (doneRid && !outputItemAdded) console.log(`${ts()} [OUTBOUND][${callSid}] [FALSE-START] response_id=${doneRid} ended with no output`);
+            markOutDone(() => {
+              if (doneRid && !outputItemAdded) console.log(`${ts()} [OUTBOUND][${callSid}] [FALSE-START] ${doneRid} no output`);
               currentResponseId = null;
               console.log(`${ts()} [OUTBOUND][${callSid}] [PACING] playback complete`);
               if (turnCount >= MAX_TURNS) setTimeout(() => { xaiWs?.close(); ws.close(); }, 3000);
@@ -681,38 +533,33 @@ app.ws("/outbound-stream", (ws: any) => {
             speechStartedAt = Date.now();
             const rid = currentResponseId;
             if (rid !== null) {
-              interruptOutAudio(); // stop paced playback immediately
-              currentResponseId = null;
+              interruptOutAudio(); currentResponseId = null;
               if (streamSid) ws.send(JSON.stringify({ event: "clear", streamSid }));
               const now = Date.now();
               if (now - lastCancelSentAt < CANCEL_DEBOUNCE_MS) {
-                console.log(`${ts()} [OUTBOUND][${callSid}] [BARGE-IN-SUPPRESSED] within debounce`);
+                console.log(`${ts()} [OUTBOUND][${callSid}] [BARGE-IN-SUPPRESSED]`);
               } else {
                 lastCancelSentAt = now; lastCancelledResponseId = rid; lastCancelTimestamp = now;
-                console.log(`${ts()} [OUTBOUND][${callSid}] [BARGE-IN] cancelling response_id=${rid} played=${playedMs}ms`);
+                console.log(`${ts()} [OUTBOUND][${callSid}] [BARGE-IN] cancelling ${rid} played=${playedMs}ms`);
                 xaiWs.send(JSON.stringify({ type: "response.cancel" }));
-                if (currentItemId && playedMs > 0) xaiWs.send(JSON.stringify({ type: "conversation.item.truncate", item_id: currentItemId, content_index: 0, audio_end_ms: playedMs }));
+                if (currentItemId && playedMs > 0)
+                  xaiWs.send(JSON.stringify({ type: "conversation.item.truncate", item_id: currentItemId, content_index: 0, audio_end_ms: playedMs }));
               }
             } else {
-              console.log(`${ts()} [OUTBOUND][${callSid}] [speech_started] no active response — normal turn`);
+              console.log(`${ts()} [OUTBOUND][${callSid}] [speech_started] normal turn`);
             }
             break;
           }
           case "input_audio_buffer.speech_stopped":
-            console.log(`${ts()} [OUTBOUND][${callSid}] speech_stopped (+${Date.now() - speechStartedAt}ms from speech_started)`);
+            console.log(`${ts()} [OUTBOUND][${callSid}] speech_stopped (+${Date.now() - speechStartedAt}ms)`);
             break;
           case "input_audio_buffer.committed":
             commitWatchdog = setTimeout(() => { console.log(`${ts()} [OUTBOUND][${callSid}] [WATCHDOG] no response.created within 2500ms`); }, 2500);
             xaiWs.send(JSON.stringify({ type: "response.create" }));
             break;
-          case "conversation.item.input_audio_transcription.completed": {
-            const transcript = m.transcript || "";
-            const turnDuration = speechStartedAt > 0 ? Date.now() - speechStartedAt : 0;
-            console.log(`${ts()} [OUTBOUND][${callSid}] [TRANSCRIPTION] "${transcript}" turn_duration=${turnDuration}ms`);
-            if (turnDuration > 0 && transcript.length > 0 && (turnDuration / transcript.length) > 150)
-              console.log(`${ts()} [OUTBOUND][${callSid}] [LONG-TURN] duration=${turnDuration}ms len=${transcript.length} — possible VAD noise`);
+          case "conversation.item.input_audio_transcription.completed":
+            console.log(`${ts()} [OUTBOUND][${callSid}] [TRANSCRIPTION] "${m.transcript}"`);
             break;
-          }
           case "response.output_audio_transcript.delta": process.stdout.write(m.delta || ""); break;
         }
       });
