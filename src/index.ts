@@ -212,11 +212,11 @@ app.ws("/media-stream/:callId", async (ws: any, req) => {
 
     if (msg.event === "start") {
       streamSid = msg.start.streamSid;
-      // Twilio sends To/From in the webhook body which we stored; also try callSid metadata
-      const phoneNumberDialed = msg.start.customParameters?.To || "";
-      const callerNumber = msg.start.customParameters?.From || "";
-      console.log(`${ts()} [${callId}] twilio ready sid=${streamSid} (+${Date.now() - callStartTime}ms)`);
-      // Per-account lookup (async, non-blocking — falls back to default if fails)
+      const cp = msg.start.customParameters || {};
+      const phoneNumberDialed = cp.To || cp.phoneNumberDialed || "";
+      const callerNumber = cp.From || cp.callerNumber || "";
+      console.log(`${ts()} [${callId}] twilio ready sid=${streamSid} to=${phoneNumberDialed} from=${callerNumber} (+${Date.now() - callStartTime}ms)`);
+      console.log(`${ts()} [${callId}] start payload: ${JSON.stringify(msg.start)}`);
       notifyCallStart(callId, phoneNumberDialed, callerNumber).then(data => {
         if (data) { callUserId = data.user_id || ""; callInstructions = data.instructions || bot.instructions; }
       }).catch(() => {});
