@@ -156,8 +156,9 @@ app.post("/twiml", (_req, res) => {
   const callerNumber = _req.body?.From || "";
   const phoneNumberDialed = _req.body?.To || "";
   console.log(`${ts()} [${callId}] incoming call to=${phoneNumberDialed} from=${callerNumber}`);
+  // Pass To/From via <Parameter> tags — available in msg.start.customParameters
   res.status(200).type("text/xml").end(
-    `<Response><Connect><Stream url="wss://${hostname}/media-stream/${callId}" /></Connect></Response>`
+    `<Response><Connect><Stream url="wss://${hostname}/media-stream/${callId}"><Parameter name="To" value="${phoneNumberDialed}" /><Parameter name="From" value="${callerNumber}" /></Stream></Connect></Response>`
   );
 });
 
