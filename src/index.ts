@@ -367,17 +367,10 @@ app.ws("/media-stream/:callId", async (ws: any, req) => {
         const activeRid = player.getActiveResponseId();
         if (activeRid !== null) {
           const playedMs = player.interrupt();
-
-          // Send clear immediately AND repeat twice more to ensure Twilio processes it
-          // Single clear can be lost in the network buffer — rapid repeats ensure it lands
-          const sendClear = () => {
-            if (streamSid) ws.send(JSON.stringify({ event: "clear", streamSid }));
-          };
-          sendClear();
-          setTimeout(sendClear, 30);
-          setTimeout(sendClear, 80);
+          if (streamSid) ws.send(JSON.stringify({ event: "clear", streamSid }));
 
           const now = Date.now();
+          // Issue 2 Fix A: debounce cancel sends — local state always updated
           if (now - lastCancelSentAt < CANCEL_DEBOUNCE_MS) {
             console.log(`${ts()} [${callId}] [BARGE-IN-SUPPRESSED] within ${CANCEL_DEBOUNCE_MS}ms debounce, skipping cancel send (played=${playedMs}ms)`);
           } else {
@@ -531,8 +524,7 @@ app.ws("/outbound-stream", (ws: any) => {
             const rid = currentResponseId;
             if (rid !== null) {
               currentResponseId = null;
-              const sendClear = () => { if (streamSid) ws.send(JSON.stringify({ event: "clear", streamSid })); };
-              sendClear(); setTimeout(sendClear, 30); setTimeout(sendClear, 80);
+              if (streamSid) ws.send(JSON.stringify({ event: "clear", streamSid }));
               const now = Date.now();
               if (now - lastCancelSentAt < CANCEL_DEBOUNCE_MS) {
                 console.log(`${ts()} [OUTBOUND][${callSid}] [BARGE-IN-SUPPRESSED] within debounce`);
