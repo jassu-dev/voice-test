@@ -43,6 +43,66 @@ async function handleToolCall(name: string, args: Record<string, any>): Promise<
   }
 }
 
+// ── Audio Playback Manager ─────────────────────────────────────────────────
+// Tracks per-response audio queue, playback position, and handles barge-in.
+// For telephony (Twilio), "playback" = sending media frames to Twilio.
+// Each mulaw chunk at 8kHz = (bytes / 1) ms (1 byte per ms at 8kHz mulaw).
+class AudioPlayer {
+  private queue: Array<{ payload: string; bytes: number }> = [];
+  private currentResponseId: string | null = null;
+  private playedMs = 0;
+  private callId: string;
+  private sendFn: (payload: string) => void;
+
+  constructor(callId: string, sendFn: (payload: string) => void) {
+    this.callId = callId;
+    this.sendFn = sendFn;
+  }
+
+  // Called for every response.output_audio.delta — only play if responseId matches current
+  play(payload: string, responseId: string) {
+    if (responseId !== this.currentResponseId) return; // stale delta — discard
+    const bytes = Buffer.from(payload, "base64").length;
+    this.queue.push({ payload, bytes });
+    // Flush immediately — stream deltas to Twilio as they arrive
+    this.flush();
+  }
+
+  // Set active response — call on response.created
+  setResponse(responseId: string) {
+    this.currentResponseId = responseId;
+    this.playedMs = 0;
+    this.queue = [];
+  }
+
+  // Hard stop + flush — call on barge-in
+  interrupt(): number {
+    const playedMs = this.playedMs;
+    this.queue = []; // flush unplayed queue
+    this.currentResponseId = null;
+    return playedMs;
+  }
+
+  // Clear current response on normal end
+  clear() {
+    this.queue = [];
+    this.currentResponseId = null;
+    this.playedMs = 0;
+  }
+
+  getCurrentResponseId() { return this.currentResponseId; }
+  getPlayedMs() { return this.playedMs; }
+
+  private flush() {
+    while (this.queue.length > 0) {
+      const chunk = this.queue.shift()!;
+      this.sendFn(chunk.payload);
+      // mulaw 8kHz: 8000 bytes/sec = 8 bytes/ms
+      this.playedMs += Math.round(chunk.bytes / 8);
+    }
+  }
+}
+
 app.get("/health", (_req, res) => res.json({ status: "ok" }));
 
 app.post("/twiml", (_req, res) => {
@@ -65,12 +125,10 @@ app.ws("/media-stream/:callId", async (ws: any, req) => {
   const WebSocket = require("ws");
   let streamSid = "";
   let sessionReady = false;
-  let turnActive = false;
-  let turnCount = 0;
-  let bargedIn = false;
-  const pendingAudio: string[] = [];
+  let currentItemId: string | null = null; // conversation item id for truncation
+  const pendingAudio: string[] = [];       // audio buffered before streamSid is set
 
-  // ── Send audio to Twilio, buffer if streamSid not ready yet ─────────────
+  // ── Send audio to Twilio ─────────────────────────────────────────────────
   const sendToTwilio = (payload: string) => {
     if (streamSid) {
       ws.send(JSON.stringify({ event: "media", streamSid, media: { payload } }), (err: any) => {
@@ -81,7 +139,9 @@ app.ws("/media-stream/:callId", async (ws: any, req) => {
     }
   };
 
-  // ── Register Twilio message handler FIRST before any await ───────────────
+  const player = new AudioPlayer(callId, sendToTwilio);
+
+  // ── Register Twilio message handler BEFORE any await ────────────────────
   ws.on("message", (raw: string) => {
     let msg: any;
     try { msg = JSON.parse(raw.toString()); } catch { return; }
@@ -89,7 +149,6 @@ app.ws("/media-stream/:callId", async (ws: any, req) => {
     if (msg.event === "start") {
       streamSid = msg.start.streamSid;
       console.log(`[${callId}] twilio ready sid=${streamSid}`);
-      // Flush buffered audio (greeting may have arrived before streamSid)
       if (pendingAudio.length > 0) {
         console.log(`[${callId}] flushing ${pendingAudio.length} buffered chunks`);
         for (const p of pendingAudio) {
@@ -122,9 +181,11 @@ app.ws("/media-stream/:callId", async (ws: any, req) => {
 
   // ── Handle xAI messages ──────────────────────────────────────────────────
   xaiWs.on("message", (data: Buffer, isBinary: boolean) => {
-    // Binary frame = raw audio (when binary transport active)
+    // Binary = raw audio frame
     if (isBinary) {
-      sendToTwilio(data.toString("base64"));
+      const payload = data.toString("base64");
+      const responseId = player.getCurrentResponseId() || "";
+      player.play(payload, responseId);
       return;
     }
 
@@ -137,20 +198,29 @@ app.ws("/media-stream/:callId", async (ws: any, req) => {
 
     switch (msg.type) {
 
-      // ── Audio: forward each delta to Twilio immediately ─────────────────
+      // ── Audio delta: stream immediately via player ───────────────────────
       case "response.output_audio.delta":
-        if (msg.delta) sendToTwilio(msg.delta);
+        if (msg.delta && msg.response_id) {
+          player.play(msg.delta, msg.response_id);
+        }
         break;
 
+      // ── New response starting ────────────────────────────────────────────
       case "response.created":
-        turnCount++;
-        turnActive = true;
-        console.log(`[${callId}] turn ${turnCount} started`);
+        console.log(`[${callId}] response started id=${msg.response?.id}`);
+        player.setResponse(msg.response?.id || "");
+        break;
+
+      // ── Track conversation item id for truncation ────────────────────────
+      case "response.output_item.added":
+        if (msg.item?.type === "message" && msg.item?.role === "assistant") {
+          currentItemId = msg.item.id;
+        }
         break;
 
       case "response.done":
       case "response.cancelled":
-        turnActive = false;
+        player.clear();
         break;
 
       case "response.output_audio_transcript.delta":
@@ -161,28 +231,46 @@ app.ws("/media-stream/:callId", async (ws: any, req) => {
         if (msg.transcript) console.log(`\n[${callId}] User: "${msg.transcript}"`);
         break;
 
-      // ── Barge-in: caller spoke while agent was talking ──────────────────
-      case "input_audio_buffer.speech_started":
-        bargedIn = turnActive;
-        turnActive = false;
-        console.log(`[${callId}] barge-in=${bargedIn}`);
-        // Clear Twilio's buffer so audio stops instantly
+      // ── BARGE-IN ─────────────────────────────────────────────────────────
+      // speech_started fires THE INSTANT VAD detects speech — act immediately
+      case "input_audio_buffer.speech_started": {
+        const activeResponseId = player.getCurrentResponseId();
+        const playedMs = player.interrupt(); // hard stop + flush queue
+
+        console.log(`[${callId}] [BARGE-IN] cancelling response_id=${activeResponseId} at ${playedMs}ms`);
+
+        // 1. Clear Twilio's jitter buffer so audio stops instantly on caller's end
         if (streamSid) ws.send(JSON.stringify({ event: "clear", streamSid }));
+
+        // 2. Cancel server-side response generation
+        if (activeResponseId) {
+          xaiWs.send(JSON.stringify({ type: "response.cancel" }));
+        }
+
+        // 3. Truncate conversation item to only what was actually played
+        // This keeps conversation history accurate for future turns
+        if (currentItemId && playedMs > 0) {
+          xaiWs.send(JSON.stringify({
+            type: "conversation.item.truncate",
+            item_id: currentItemId,
+            content_index: 0,
+            audio_end_ms: playedMs,
+          }));
+        }
         break;
+      }
 
       case "input_audio_buffer.speech_stopped":
         console.log(`[${callId}] speech_stopped`);
         break;
 
-      // ── After commit: request response (server_vad doesn't always auto-request) ──
+      // ── After commit: request response ──────────────────────────────────
       case "input_audio_buffer.committed":
         console.log(`[${callId}] committed`);
-        bargedIn = false;
         xaiWs.send(JSON.stringify({ type: "response.create" }));
         break;
 
-      // ── Session configured: send greeting via force_message ────────────
-      // force_message = pure TTS synthesis, no LLM round-trip = fast first word
+      // ── Session configured: send greeting ───────────────────────────────
       case "session.updated":
         sessionReady = true;
         console.log(`[${callId}] session ready`);
@@ -197,30 +285,30 @@ app.ws("/media-stream/:callId", async (ws: any, req) => {
         }));
         break;
 
-      // ── Configure session when conversation is created ──────────────────
+      // ── Configure session ────────────────────────────────────────────────
       case "conversation.created":
         xaiWs.send(JSON.stringify({
           type: "session.update",
           session: {
             instructions: bot.instructions,
-            voice: "celeste",       // warm, reassuring — great for phone support
-            reasoning: { effort: "none" },   // fastest responses for conversation
+            voice: "celeste",
+            reasoning: { effort: "none" },
             turn_detection: {
               type: "server_vad",
-              threshold: 0.6,              // catches speech reliably on phone calls
-              silence_duration_ms: 500,    // natural pause before responding
-              prefix_padding_ms: 300,      // don't clip first syllable
+              threshold: 0.6,           // lower = catches speech on noisy phone lines
+              silence_duration_ms: 500, // natural conversational pause
+              prefix_padding_ms: 300,   // don't clip first syllable
             },
             audio: {
-              input:  { format: { type: "audio/pcmu" } },  // Twilio native mulaw
-              output: { format: { type: "audio/pcmu" } },  // Twilio native mulaw
+              input:  { format: { type: "audio/pcmu" } }, // Twilio native
+              output: { format: { type: "audio/pcmu" } }, // Twilio native
             },
             ...(ENABLE_TOOLS ? { tools } : {}),
           },
         }));
         break;
 
-      // ── Function tool call ──────────────────────────────────────────────
+      // ── Function tool call ───────────────────────────────────────────────
       case "response.output_item.done":
         if (msg.item?.type === "function_call") {
           (async () => {
@@ -231,9 +319,23 @@ app.ws("/media-stream/:callId", async (ws: any, req) => {
               type: "conversation.item.create",
               item: { type: "function_call_output", call_id: msg.item.call_id, output: result },
             }));
+            // Wait for current playback to finish before requesting next response
+            // (avoids audio overlap on tool calls)
+            const waitForPlayback = () => new Promise<void>(res => {
+              const check = () => {
+                if (!player.getCurrentResponseId()) { res(); return; }
+                setTimeout(check, 50);
+              };
+              check();
+            });
+            await waitForPlayback();
             xaiWs.send(JSON.stringify({ type: "response.create" }));
           })();
         }
+        break;
+
+      case "conversation.item.truncated":
+        console.log(`[${callId}] item truncated at ${msg.audio_end_ms}ms`);
         break;
 
       case "error":
@@ -264,7 +366,9 @@ app.ws("/outbound-stream", (ws: any) => {
   let xaiWs: any = null;
   let sessionReady = false;
   let turnCount = 0;
-  let turnActive = false;
+  let currentResponseId: string | null = null;
+  let currentItemId: string | null = null;
+  let playedMs = 0;
 
   ws.on("message", (raw: string) => {
     let msg: any;
@@ -282,7 +386,7 @@ app.ws("/outbound-stream", (ws: any) => {
           type: "session.update",
           session: {
             instructions: OUTBOUND_INSTRUCTIONS,
-            voice: "atlas",        // confident, commanding — good for outbound
+            voice: "atlas",
             reasoning: { effort: "none" },
             turn_detection: {
               type: "server_vad",
@@ -300,7 +404,11 @@ app.ws("/outbound-stream", (ws: any) => {
 
       xaiWs.on("message", (d: Buffer, isBinary: boolean) => {
         if (isBinary) {
-          if (streamSid) ws.send(JSON.stringify({ event: "media", streamSid, media: { payload: d.toString("base64") } }));
+          const payload = d.toString("base64");
+          if (streamSid && currentResponseId) {
+            ws.send(JSON.stringify({ event: "media", streamSid, media: { payload } }));
+            playedMs += Math.round(d.length / 8);
+          }
           return;
         }
         let m: any;
@@ -310,25 +418,44 @@ app.ws("/outbound-stream", (ws: any) => {
         switch (m.type) {
           case "session.updated":
             sessionReady = true;
-            // Agent speaks first on outbound
             xaiWs.send(JSON.stringify({ type: "response.create" }));
             break;
           case "response.created":
             turnCount++;
-            turnActive = true;
+            currentResponseId = m.response?.id || null;
+            playedMs = 0;
+            break;
+          case "response.output_item.added":
+            if (m.item?.type === "message" && m.item?.role === "assistant") currentItemId = m.item.id;
             break;
           case "response.output_audio.delta":
-            if (m.delta && streamSid)
+            if (m.delta && m.response_id === currentResponseId && streamSid) {
               ws.send(JSON.stringify({ event: "media", streamSid, media: { payload: m.delta } }));
+              playedMs += Math.round(Buffer.from(m.delta, "base64").length / 8);
+            }
             break;
           case "response.done":
-            turnActive = false;
+          case "response.cancelled":
+            currentResponseId = null;
             if (turnCount >= MAX_TURNS) setTimeout(() => { xaiWs?.close(); ws.close(); }, 3000);
             break;
-          case "input_audio_buffer.speech_started":
-            turnActive = false;
+          case "input_audio_buffer.speech_started": {
+            const rid = currentResponseId;
+            const pms = playedMs;
+            console.log(`[OUTBOUND][${callSid}] [BARGE-IN] cancelling response_id=${rid} at ${pms}ms`);
+            currentResponseId = null;
             if (streamSid) ws.send(JSON.stringify({ event: "clear", streamSid }));
+            if (rid) xaiWs.send(JSON.stringify({ type: "response.cancel" }));
+            if (currentItemId && pms > 0) {
+              xaiWs.send(JSON.stringify({
+                type: "conversation.item.truncate",
+                item_id: currentItemId,
+                content_index: 0,
+                audio_end_ms: pms,
+              }));
+            }
             break;
+          }
           case "input_audio_buffer.committed":
             xaiWs.send(JSON.stringify({ type: "response.create" }));
             break;
