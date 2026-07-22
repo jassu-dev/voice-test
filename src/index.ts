@@ -11,22 +11,37 @@ const XAI_API_KEY = process.env.XAI_API_KEY || "";
 const API_URL = process.env.API_URL || "wss://api.x.ai/v1/realtime";
 const ENABLE_TOOLS = process.env.ENABLE_TOOLS !== "false";
 
-// ── VAD config — tune via env vars without touching code ──────────────────
-// Issue 1 Fix A: Raise threshold to 0.75 for real phone lines (noisy carriers)
-// Test: set VAD_THRESHOLD=0.7 first, call from real phone, check turn durations
-// If turns still stay open >2x actual speaking time, try VAD_THRESHOLD=0.75
+// ── Tunable config — all via env vars, no code changes needed ────────────
 const VAD_CONFIG = {
-  threshold: parseFloat(process.env.VAD_THRESHOLD || "0.75"),
-  silence_duration_ms: parseInt(process.env.VAD_SILENCE_MS || "800"),
-  prefix_padding_ms: parseInt(process.env.VAD_PREFIX_MS || "400"),
+  threshold: parseFloat(process.env.VAD_THRESHOLD || "0.5"),
+  silence_duration_ms: parseInt(process.env.VAD_SILENCE_MS || "450"),
+  prefix_padding_ms: parseInt(process.env.VAD_PREFIX_MS || "250"),
 };
 
-// Issue 2 Fix A: Debounce rapid-fire response.cancel sends
 const CANCEL_DEBOUNCE_MS = parseInt(process.env.CANCEL_DEBOUNCE_MS || "250");
 
-// Issue 3 Fix B: Filler injection threshold
-const FILLER_THRESHOLD_MS = parseInt(process.env.FILLER_THRESHOLD_MS || "700");
+// Filler: 350ms = fires sooner on slow turns without triggering on fast ones
+const FILLER_THRESHOLD_MS = parseInt(process.env.FILLER_THRESHOLD_MS || "350");
 const FILLER_PHRASES = ["Mm-hmm,", "Let me see,", "Sure,"];
+
+// Voice: test rigel, naksh, lumen, celeste on real 8kHz phone lines
+// Some voices are crisper at narrowband — subjective, test with real callers
+const VOICE_ID = process.env.VOICE_ID || "rigel";
+
+// Output speed: 1.0 = normal, 1.05-1.1 = slightly snappier, >1.15 sounds artificial
+const OUTPUT_SPEED = parseFloat(process.env.OUTPUT_SPEED || "1.0");
+
+// Pronunciation replacements — add business-specific terms that get mispronounced
+// Key = text in transcript, Value = how it should sound when spoken
+const REPLACE_MAP: Record<string, string> = {
+  // "YourBrand": "Your Brand",  // example — add real terms here
+};
+
+// Keyterms for transcription accuracy — business/domain vocabulary
+// grok-transcribe uses these to bias ASR toward recognising specific words
+const KEYTERMS: string[] = process.env.KEYTERMS
+  ? process.env.KEYTERMS.split(",").map(k => k.trim())
+  : [];
 let fillerIndex = 0;
 const nextFiller = () => { const f = FILLER_PHRASES[fillerIndex % FILLER_PHRASES.length]; fillerIndex++; return f; };
 
@@ -308,13 +323,23 @@ app.ws("/media-stream/:callId", async (ws: any, req) => {
     type: "session.update",
     session: {
       instructions: bot.instructions,
-      voice: "celeste",
+      voice: VOICE_ID,
       reasoning: { effort: "none" },
       turn_detection: { type: "server_vad", ...VAD_CONFIG },
       audio: {
-        input: { format: { type: "audio/pcmu" }, transcription: { model: "grok-transcribe" } },
-        output: { format: { type: "audio/pcmu" } },
+        input: {
+          format: { type: "audio/pcmu" },
+          transcription: {
+            model: "grok-transcribe",
+            ...(KEYTERMS.length > 0 ? { keyterms: KEYTERMS } : {}),
+          },
+        },
+        output: {
+          format: { type: "audio/pcmu" },
+          ...(OUTPUT_SPEED !== 1.0 ? { speed: OUTPUT_SPEED } : {}),
+        },
       },
+      ...(Object.keys(REPLACE_MAP).length > 0 ? { replace: REPLACE_MAP } : {}),
       ...(ENABLE_TOOLS ? { tools } : {}),
     },
   }));
@@ -578,9 +603,22 @@ app.ws("/outbound-stream", (ws: any) => {
       xaiWs.on("open", () => {
         console.log(`${ts()} [OUTBOUND][${callSid}] [SEND] session.update dispatched`);
         xaiWs.send(JSON.stringify({ type: "session.update", session: {
-          instructions: OUTBOUND_INSTRUCTIONS, voice: "atlas", reasoning: { effort: "none" },
+          instructions: OUTBOUND_INSTRUCTIONS, voice: VOICE_ID, reasoning: { effort: "none" },
           turn_detection: { type: "server_vad", ...VAD_CONFIG },
-          audio: { input: { format: { type: "audio/pcmu" }, transcription: { model: "grok-transcribe" } }, output: { format: { type: "audio/pcmu" } } },
+          audio: {
+            input: {
+              format: { type: "audio/pcmu" },
+              transcription: {
+                model: "grok-transcribe",
+                ...(KEYTERMS.length > 0 ? { keyterms: KEYTERMS } : {}),
+              },
+            },
+            output: {
+              format: { type: "audio/pcmu" },
+              ...(OUTPUT_SPEED !== 1.0 ? { speed: OUTPUT_SPEED } : {}),
+            },
+          },
+          ...(Object.keys(REPLACE_MAP).length > 0 ? { replace: REPLACE_MAP } : {}),
         }}));
       });
 
@@ -684,7 +722,8 @@ app.ws("/outbound-stream", (ws: any) => {
 const port = process.env.PORT || "3000";
 app.listen(port, () => {
   console.log(`Server on http://localhost:${port}`);
+  console.log(`Voice: ${VOICE_ID} | Speed: ${OUTPUT_SPEED} | Tools: ${ENABLE_TOOLS ? "on" : "off"}`);
   console.log(`VAD: threshold=${VAD_CONFIG.threshold} silence=${VAD_CONFIG.silence_duration_ms}ms prefix=${VAD_CONFIG.prefix_padding_ms}ms`);
-  console.log(`Cancel debounce: ${CANCEL_DEBOUNCE_MS}ms | Filler threshold: ${FILLER_THRESHOLD_MS}ms`);
-  console.log(`Tools: ${ENABLE_TOOLS ? "enabled" : "disabled"} | xAI warm pool: seeded`);
+  console.log(`Cancel debounce: ${CANCEL_DEBOUNCE_MS}ms | Filler: ${FILLER_THRESHOLD_MS}ms | Keyterms: ${KEYTERMS.length > 0 ? KEYTERMS.join(",") : "none"}`);
+  console.log(`xAI warm pool: seeded`);
 });
